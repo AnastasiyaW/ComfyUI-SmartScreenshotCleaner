@@ -138,11 +138,13 @@ class AutoBorderCrop:
 
     # Константы — Color detection
     SATURATION_THRESHOLD = 30.0    # Порог насыщенности для цветного контента
+    NEUTRAL_SATURATION = 25.0      # Ниже = нейтральный цвет (чёрный/серый/белый)
     BLACK_THRESHOLD = 30           # Ниже = чёрный фон
     WHITE_THRESHOLD = 225          # Выше = белый фон
     COLOR_SATURATION_THRESHOLD = 20
     COLORFUL_RATIO_THRESHOLD = 0.2 # 20% цветных пикселей = цветной контент
     HIGH_DYNAMICS_STD = 50.0       # STD для игнорирования safe space
+    DYNAMICS_BOUNDARY_STD = 35.0   # Порог для границы динамики
 
     # Константы — Limits
     MIN_CONTENT_RATIO = 0.3        # Минимум 30% контента после обрезки
@@ -495,6 +497,118 @@ class AutoBorderCrop:
 
         return False, 0
 
+    def _is_neutral_color(self, pixels: torch.Tensor) -> bool:
+        """Проверяет, являются ли пиксели нейтральными (чёрный/серый/белый).
+        Нейтральный = низкая насыщенность (R ≈ G ≈ B).
+        """
+        if pixels.numel() == 0:
+            return True
+        saturation = (pixels.max(dim=-1).values - pixels.min(dim=-1).values).float().mean().item()
+        return saturation < self.NEUTRAL_SATURATION
+
+    def _find_dynamics_boundary(self, img: torch.Tensor, side: str, content_bbox: Optional[Tuple]) -> Optional[int]:
+        """Находит границу между областью с высокой динамикой (фото) и нейтральным фоном.
+
+        Логика:
+        1. Если YOLO нашёл объект внутри области с высокой динамикой — это контент
+        2. Сканируем от края к центру, ищем где начинается динамика
+        3. Возвращаем позицию границы для обрезки
+
+        Args:
+            img: Изображение [H, W, C] в формате 0-255
+            side: Сторона ('left', 'right', 'top', 'bottom')
+            content_bbox: Bbox контента (y1, y2, x1, x2) или None
+
+        Returns:
+            Позиция границы для обрезки или None
+        """
+        h, w = img.shape[:2]
+        scan_step = 10  # Шаг сканирования
+
+        if side == 'right':
+            # Сканируем справа налево
+            for x in range(w - scan_step, w // 3, -scan_step):
+                strip = img[:, x:x + scan_step, :3]
+                strip_pixels = strip.reshape(-1, 3).float()
+
+                # Проверяем динамику
+                strip_std = strip.float().std().item()
+                is_neutral = self._is_neutral_color(strip_pixels)
+
+                # Если нашли область с высокой динамикой и не нейтральную — это контент
+                if strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
+                    # Проверяем что content_bbox внутри этой области
+                    if content_bbox:
+                        _, _, bx1, bx2 = content_bbox
+                        if bx2 > x:  # Контент справа от этой линии
+                            boundary = w - x
+                            logger.info(f"right: dynamics boundary at x={x}, crop={boundary}, std={strip_std:.1f}")
+                            return boundary
+                    else:
+                        # Нет bbox, но есть динамика — режем
+                        boundary = w - x
+                        logger.info(f"right: dynamics boundary (no bbox) at x={x}, crop={boundary}")
+                        return boundary
+
+        elif side == 'left':
+            # Сканируем слева направо
+            for x in range(0, w * 2 // 3, scan_step):
+                strip = img[:, x:x + scan_step, :3]
+                strip_pixels = strip.reshape(-1, 3).float()
+
+                strip_std = strip.float().std().item()
+                is_neutral = self._is_neutral_color(strip_pixels)
+
+                if strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
+                    if content_bbox:
+                        _, _, bx1, bx2 = content_bbox
+                        if bx1 < x + scan_step:
+                            logger.info(f"left: dynamics boundary at x={x}, crop={x}, std={strip_std:.1f}")
+                            return x
+                    else:
+                        logger.info(f"left: dynamics boundary (no bbox) at x={x}, crop={x}")
+                        return x
+
+        elif side == 'top':
+            for y in range(0, h * 2 // 3, scan_step):
+                strip = img[y:y + scan_step, :, :3]
+                strip_pixels = strip.reshape(-1, 3).float()
+
+                strip_std = strip.float().std().item()
+                is_neutral = self._is_neutral_color(strip_pixels)
+
+                if strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
+                    if content_bbox:
+                        by1, by2, _, _ = content_bbox
+                        if by1 < y + scan_step:
+                            logger.info(f"top: dynamics boundary at y={y}, crop={y}")
+                            return y
+                    else:
+                        logger.info(f"top: dynamics boundary (no bbox) at y={y}")
+                        return y
+
+        elif side == 'bottom':
+            for y in range(h - scan_step, h // 3, -scan_step):
+                strip = img[y:y + scan_step, :, :3]
+                strip_pixels = strip.reshape(-1, 3).float()
+
+                strip_std = strip.float().std().item()
+                is_neutral = self._is_neutral_color(strip_pixels)
+
+                if strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
+                    if content_bbox:
+                        by1, by2, _, _ = content_bbox
+                        if by2 > y:
+                            boundary = h - y
+                            logger.info(f"bottom: dynamics boundary at y={y}, crop={boundary}")
+                            return boundary
+                    else:
+                        boundary = h - y
+                        logger.info(f"bottom: dynamics boundary (no bbox) at y={y}")
+                        return boundary
+
+        return None
+
     def _check_content_at_edge(self, img: torch.Tensor, side: str, position: int) -> bool:
         """Проверяет, есть ли контент (не серый) на указанной позиции от края."""
         h, w = img.shape[:2]
@@ -607,18 +721,18 @@ class AutoBorderCrop:
 
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
 
-        # 3. Проверяем края — режем если чисто серый/чёрный/белый ИЛИ UI панель
+        # 3. Проверяем края — режем если нейтральный фон (чёрный/серый/белый) рядом с динамичным контентом
         for side in ['left', 'right']:
             is_pure, edge_color = self._is_pure_border_color(img_gpu, side)
             detected_border = self._detect_border_gpu(img_gpu, side, sensitivity, min_border_size)
 
-            # НОВОЕ: Детектируем UI панели (Instagram, браузер и т.д.)
-            is_ui_panel, panel_width = self._is_ui_panel(img_gpu, side)
+            # ГЛАВНОЕ: Ищем границу динамики — где заканчивается нейтральный фон и начинается контент
+            dynamics_boundary = self._find_dynamics_boundary(img_gpu, side, final_bbox)
 
-            if is_ui_panel and panel_width > 0:
-                # UI панель найдена — режем её
-                crop[side] = panel_width
-                logger.info(f"{side}: UI panel detected, crop={panel_width}")
+            if dynamics_boundary is not None and dynamics_boundary > 0:
+                # Нашли чёткую границу между нейтральным фоном и цветным контентом
+                crop[side] = dynamics_boundary
+                logger.info(f"{side}: dynamics boundary found, crop={dynamics_boundary}")
             elif is_pure and detected_border > 0:
                 # Дополнительная проверка — есть ли контент на границе обрезки
                 has_content = self._check_content_at_edge(img_gpu, side, detected_border)
@@ -677,16 +791,27 @@ class AutoBorderCrop:
         top_border = self._detect_border_gpu(img_gpu, 'top', sensitivity, min_border_size)
         bottom_border = self._detect_border_gpu(img_gpu, 'bottom', sensitivity, min_border_size)
 
+        # Сначала проверяем границу динамики для top/bottom
+        top_dynamics = self._find_dynamics_boundary(img_gpu, 'top', final_bbox)
+        bottom_dynamics = self._find_dynamics_boundary(img_gpu, 'bottom', final_bbox)
+
+        if top_dynamics is not None and top_dynamics > 0:
+            crop['top'] = top_dynamics
+            logger.info(f"Top: dynamics boundary found, crop={top_dynamics}")
+        elif bottom_dynamics is not None and bottom_dynamics > 0:
+            crop['bottom'] = bottom_dynamics
+            logger.info(f"Bottom: dynamics boundary found, crop={bottom_dynamics}")
+
         if final_bbox:
             by1, by2, bx1, bx2 = final_bbox
             safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
             safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
-            # НОВОЕ: Проверяем динамику контента на границах top/bottom
+            # Проверяем динамику контента на границах (если ещё не обработано)
             top_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'top', top_border) if top_border > 0 else False
             bottom_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'bottom', bottom_border) if bottom_border > 0 else False
 
-            if top_border > 0:
+            if crop['top'] == 0 and top_border > 0:
                 if top_has_dynamics:
                     # Высокая динамика — игнорируем safe space, режем полностью
                     crop['top'] = top_border
@@ -717,7 +842,7 @@ class AutoBorderCrop:
                 else:
                     crop['top'] = top_border
 
-            if bottom_border > 0:
+            if crop['bottom'] == 0 and bottom_border > 0:
                 if bottom_has_dynamics:
                     # Высокая динамика — игнорируем safe space, режем полностью
                     crop['bottom'] = bottom_border
