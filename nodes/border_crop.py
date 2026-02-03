@@ -228,16 +228,35 @@ class AutoBorderCrop:
         return saturation, std
 
     def _is_border_line(self, saturation: float, std: float) -> bool:
-        """Проверяет, является ли линия частью рамки (серый/ч/б, однотонная)."""
-        is_gray = saturation < self.GRAY_MAX_SATURATION
+        """Проверяет, является ли линия частью рамки.
+
+        Рамка = ОДНОТОННАЯ область (низкая STD).
+        Даже если есть небольшой цвет — если однотонно, это рамка!
+        """
+        # Главный критерий — однотонность (низкая динамика)
         is_uniform = std < self.GRAY_MAX_STD
-        return is_gray and is_uniform
+        # Дополнительно: серый (R≈G≈B)
+        is_gray = saturation < self.GRAY_MAX_SATURATION
+
+        # Однотонный серый — 100% рамка
+        if is_uniform and is_gray:
+            return True
+
+        # Однотонный но с небольшим цветом — тоже рамка (напр. светло-голубой UI)
+        # Но только если очень однотонный (STD < 10)
+        if std < 10.0:
+            return True
+
+        return False
 
     def _is_picture_line(self, saturation: float, std: float) -> bool:
-        """Проверяет, является ли линия частью картинки (цвет или динамика)."""
+        """Проверяет, является ли линия частью картинки (цвет И/ИЛИ динамика)."""
         has_color = saturation >= self.PICTURE_MIN_SATURATION
         has_dynamics = std >= self.PICTURE_MIN_STD
-        return has_color or has_dynamics
+
+        # Картинка = есть динамика (разнообразие пикселей)
+        # ИЛИ есть цвет + не совсем однотонно
+        return has_dynamics or (has_color and std >= 10.0)
 
     def _scan_from_edge(self, img: torch.Tensor, side: str) -> Tuple[int, bool]:
         """Сканирует от края к центру, ищет границу рамки.
@@ -267,6 +286,9 @@ class AutoBorderCrop:
         found_picture = False
 
         # Сканируем по 1 пикселю для точности
+        uncertain_count = 0  # Счётчик неопределённых линий подряд
+        MAX_UNCERTAIN = 5    # Разрешаем до 5 неопределённых линий (артефакты сжатия)
+
         for pos in range(0, max_scan):
             line = get_line(pos)
             if line.numel() == 0:
@@ -274,19 +296,22 @@ class AutoBorderCrop:
 
             saturation, std = self._analyze_line(line)
 
-            # Это картинка? (цвет или динамика)
+            # Это картинка? (динамика или цвет + не однотонно)
             if self._is_picture_line(saturation, std):
                 logger.info(f"{side}: PICTURE at {pos}px (sat={saturation:.1f}, std={std:.1f})")
                 found_picture = True
                 break
 
-            # Это рамка? (серый и однотонный)
+            # Это рамка? (однотонная область)
             if self._is_border_line(saturation, std):
                 border_size = pos + 1
+                uncertain_count = 0  # Сбрасываем счётчик
             else:
-                # Неопределённая зона — стоп
-                logger.info(f"{side}: uncertain at {pos}px (sat={saturation:.1f}, std={std:.1f})")
-                break
+                # Неопределённая зона — считаем
+                uncertain_count += 1
+                if uncertain_count >= MAX_UNCERTAIN:
+                    logger.info(f"{side}: too many uncertain lines at {pos}px, stop")
+                    break
 
         return (border_size if border_size >= self.MIN_BORDER_TO_CUT else 0, found_picture)
 
