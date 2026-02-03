@@ -1,8 +1,10 @@
 import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 import numpy as np
 import os
 import logging
-import cv2
+from typing import Optional, Tuple, List
 
 logger = logging.getLogger("HappyIn")
 if not logger.handlers:
@@ -20,10 +22,104 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-class AutoBorderCrop:
-    """Обрезает однотонные чёрные/белые/серые рамки с краёв изображения."""
+def _get_surrounding_color_gpu(img: torch.Tensor, x1: int, y1: int, x2: int, y2: int, margin: int = 10) -> torch.Tensor:
+    """Получает РЕАЛЬНЫЙ цвет пикселей вокруг области на GPU (без нормализации к чёрному/белому)."""
+    h, w = img.shape[:2]
+    pixels = []
 
-    SAFE_MARGIN = 50  # Минимум пикселей от главного объекта
+    if y1 > 0:
+        pixels.append(img[max(0, y1-margin):y1, x1:x2, :3].reshape(-1, 3))
+    if y2 < h:
+        pixels.append(img[y2:min(h, y2+margin), x1:x2, :3].reshape(-1, 3))
+    if x1 > 0:
+        pixels.append(img[y1:y2, max(0, x1-margin):x1, :3].reshape(-1, 3))
+    if x2 < w:
+        pixels.append(img[y1:y2, x2:min(w, x2+margin), :3].reshape(-1, 3))
+
+    if not pixels:
+        return torch.full((3,), 128, device=img.device, dtype=img.dtype)
+
+    all_pixels = torch.cat(pixels, dim=0).float()
+    # Возвращаем реальный медианный цвет БЕЗ нормализации
+    median_color = all_pixels.median(dim=0).values
+
+    return median_color
+
+
+def _morphology_open_close_gpu(mask: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    """Морфологические операции open + close на GPU через max/min pooling."""
+    mask_4d = mask.unsqueeze(0).unsqueeze(0).float()
+    padding = kernel_size // 2
+
+    eroded = -F.max_pool2d(-mask_4d, kernel_size, stride=1, padding=padding)
+    opened = F.max_pool2d(eroded, kernel_size, stride=1, padding=padding)
+    dilated = F.max_pool2d(opened, kernel_size, stride=1, padding=padding)
+    closed = -F.max_pool2d(-dilated, kernel_size, stride=1, padding=padding)
+
+    return closed.squeeze(0).squeeze(0)
+
+
+# Общий кэш для YOLO моделей
+_yolo_models_cache = {}
+
+
+def _load_yolo_model(model_name: str, device: torch.device):
+    """Загружает YOLO модель с кэшированием. Автоматически скачивает если нет."""
+    cache_key = f"{model_name}_{device}"
+
+    if cache_key in _yolo_models_cache:
+        return _yolo_models_cache[cache_key]
+
+    try:
+        from ultralytics import YOLO
+
+        if model_name == "yolo_person":
+            # YOLOv11n — быстрый и точный для детекции людей
+            # Автоматически скачается при первом использовании
+            model = YOLO("yolo11n.pt")
+            logger.info("Using YOLOv11n for person detection (auto-download if needed)")
+        elif model_name == "omniparser":
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(
+                "microsoft/OmniParser-v2.0",
+                "icon_detect/model.pt",
+                cache_dir=os.path.join(os.path.dirname(__file__), "..", "models")
+            )
+            model = YOLO(path)
+        else:
+            # Fallback на указанную модель
+            model = YOLO(f"{model_name}.pt")
+
+        if device.type in ("cuda", "mps"):
+            model.to(device)
+
+        _yolo_models_cache[cache_key] = model
+        logger.info(f"YOLO {model_name} loaded on {device}")
+        return model
+
+    except Exception as e:
+        logger.error(f"Failed to load YOLO {model_name}: {e}")
+        return None
+
+
+class AutoBorderCrop:
+    """Обрезает однотонные чёрные/белые/серые рамки с краёв изображения.
+    Использует YOLO для детекции людей и построения safe bbox."""
+
+    # Константы класса
+    SAFE_MARGIN_VERTICAL = 50      # Отступ сверху/снизу от контента
+    SAFE_MARGIN_HORIZONTAL = 200   # Большой отступ слева/справа (защита рук)
+    EDGE_SIZE = 30
+    CORNER_SIZE_RATIO = 4
+    MAX_CORNER_SIZE = 100
+    UNIFORM_STD_THRESHOLD = 15.0
+    DYNAMIC_STD_THRESHOLD = 40.0
+    SATURATION_THRESHOLD = 30.0
+    MIN_CONTENT_RATIO = 0.3
+    SECOND_PASS_SENSITIVITY_MULTIPLIER = 1.5
+    BLACK_THRESHOLD = 30
+    WHITE_THRESHOLD = 225
+    COLOR_SATURATION_THRESHOLD = 20
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -40,61 +136,229 @@ class AutoBorderCrop:
     FUNCTION = "crop_borders"
     CATEGORY = "image/preprocessing"
 
+    @torch.no_grad()
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
-        img = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        device = get_device()
+        batch_size = image.shape[0]
+        results = []
+
+        for batch_idx in range(batch_size):
+            single_image = image[batch_idx]
+            result = self._process_single_image_gpu(single_image, sensitivity, min_border_size, device)
+            results.append(result)
+
+        if len(results) == 1:
+            return (results[0].unsqueeze(0),)
+
+        max_h = max(r.shape[0] for r in results)
+        max_w = max(r.shape[1] for r in results)
+
+        padded_results = []
+        for r in results:
+            h, w = r.shape[:2]
+            if h < max_h or w < max_w:
+                pad_h = max_h - h
+                pad_w = max_w - w
+                r = F.pad(r.permute(2, 0, 1), (0, pad_w, 0, pad_h), mode='constant', value=0).permute(1, 2, 0)
+            padded_results.append(r)
+
+        return (torch.stack(padded_results),)
+
+    def _detect_person_bbox_yolo(self, img_gpu: torch.Tensor, device: torch.device) -> Optional[Tuple[int, int, int, int]]:
+        """Детектирует человека через YOLO v11 и возвращает bbox."""
+        try:
+            model = _load_yolo_model("yolo_person", device)
+            if model is None:
+                return None
+
+            # Конвертируем для YOLO
+            img_np = img_gpu.cpu().numpy().astype(np.uint8)
+
+            # Инференс
+            results = model.predict(img_np, conf=0.3, verbose=False, device=device, imgsz=640, classes=[0])  # class 0 = person
+
+            if not results or len(results) == 0:
+                return None
+
+            # Находим самый большой bbox человека
+            best_box = None
+            best_area = 0
+
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for i in range(len(result.boxes)):
+                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
+                    x1, y1, x2, y2 = box
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > best_area:
+                        best_area = area
+                        best_box = (y1, y2, x1, x2)  # (top, bottom, left, right)
+
+            if best_box:
+                logger.info(f"YOLO detected person bbox: {best_box}")
+            return best_box
+
+        except Exception as e:
+            logger.warning(f"YOLO person detection failed: {e}")
+            return None
+
+    def _is_pure_border_color(self, img: torch.Tensor, side: str, depth: int = 30) -> Tuple[bool, Optional[torch.Tensor]]:
+        """Проверяет, является ли край чисто чёрным/белым/серым.
+        Возвращает (is_pure, color) где color - медианный цвет края."""
         h, w = img.shape[:2]
+
+        if side == 'left':
+            strip = img[:, 0:depth, :3]
+        elif side == 'right':
+            strip = img[:, w-depth:w, :3]
+        elif side == 'top':
+            strip = img[0:depth, :, :3]
+        else:  # bottom
+            strip = img[h-depth:h, :, :3]
+
+        pixels = strip.reshape(-1, 3).float()
+        median = pixels.median(dim=0).values
+        std = pixels.std(dim=0).mean().item()
+
+        # Проверяем насыщенность (серый = низкая насыщенность)
+        saturation = (median.max() - median.min()).item()
+        mean_brightness = median.mean().item()
+
+        # Чистый край: низкая std, низкая насыщенность, и либо тёмный либо светлый
+        is_pure = (std < self.UNIFORM_STD_THRESHOLD and
+                   saturation < self.SATURATION_THRESHOLD and
+                   (mean_brightness < 50 or mean_brightness > 200))
+
+        return is_pure, median
+
+    def _check_content_at_edge(self, img: torch.Tensor, side: str, position: int) -> bool:
+        """Проверяет, есть ли контент (не серый) на указанной позиции от края."""
+        h, w = img.shape[:2]
+
+        if side == 'left':
+            strip = img[:, position:position+5, :3] if position < w else None
+        elif side == 'right':
+            pos = w - position - 5
+            strip = img[:, max(0, pos):w-position, :3] if position < w else None
+        elif side == 'top':
+            strip = img[position:position+5, :, :3] if position < h else None
+        else:  # bottom
+            pos = h - position - 5
+            strip = img[max(0, pos):h-position, :, :3] if position < h else None
+
+        if strip is None or strip.numel() == 0:
+            return False
+
+        pixels = strip.reshape(-1, 3).float()
+
+        # Проверяем насыщенность — если есть цветные пиксели, это контент
+        max_ch = pixels.max(dim=1).values
+        min_ch = pixels.min(dim=1).values
+        saturation = max_ch - min_ch
+
+        # Проверяем яркость — не чисто чёрный/белый
+        brightness = pixels.mean(dim=1)
+
+        # Контент = цветные пиксели ИЛИ средняя яркость (не чёрное/белое)
+        color_content = (saturation > 30).float().mean().item()
+        brightness_content = ((brightness > 40) & (brightness < 220)).float().mean().item()
+
+        has_content = color_content > 0.1 or brightness_content > 0.3
+        return has_content
+
+    def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> torch.Tensor:
+        """Обрабатывает одно изображение полностью на GPU."""
+        img_gpu = (image.to(device) * 255.0).float()
+        h, w = img_gpu.shape[:2]
         need_lama = False
 
-        # Находим bbox главного объекта
-        content_bbox = self._find_content_bbox(img)
-        logger.info(f"Content bbox: {content_bbox}")
+        # 1. Пробуем детектировать человека через YOLO (быстрее и точнее)
+        person_bbox = self._detect_person_bbox_yolo(img_gpu, device)
 
-        # Детектируем рамки слева и справа
+        # 2. Fallback на детекцию контента по цвету
+        content_bbox = self._find_content_bbox_gpu(img_gpu)
+
+        # Объединяем bbox'ы — берём максимальный охват
+        if person_bbox and content_bbox:
+            py1, py2, px1, px2 = person_bbox
+            cy1, cy2, cx1, cx2 = content_bbox
+            final_bbox = (min(py1, cy1), max(py2, cy2), min(px1, cx1), max(px2, cx2))
+            logger.info(f"Combined bbox (person + content): {final_bbox}")
+        elif person_bbox:
+            final_bbox = person_bbox
+            logger.info(f"Using person bbox: {final_bbox}")
+        else:
+            final_bbox = content_bbox
+            logger.info(f"Using content bbox: {final_bbox}")
+
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
-        crop['left'] = self._detect_border(img, 'left', sensitivity, min_border_size)
-        crop['right'] = self._detect_border(img, 'right', sensitivity, min_border_size)
 
-        # Сверху и снизу — определяем тип краёв
-        top_type = self._analyze_edge_strip(img, 'top')
-        bottom_type = self._analyze_edge_strip(img, 'bottom')
+        # 3. Проверяем края — режем ТОЛЬКО если чисто серый/чёрный/белый И нет контента
+        for side in ['left', 'right']:
+            is_pure, edge_color = self._is_pure_border_color(img_gpu, side)
+            detected_border = self._detect_border_gpu(img_gpu, side, sensitivity, min_border_size)
+
+            if is_pure and detected_border > 0:
+                # Дополнительная проверка — есть ли контент на границе обрезки
+                has_content = self._check_content_at_edge(img_gpu, side, detected_border)
+
+                if has_content:
+                    logger.info(f"{side}: has content at border {detected_border}, not cropping")
+                    crop[side] = 0
+                elif final_bbox:
+                    # Ограничиваем обрезку safe margin от объекта
+                    _, _, bx1, bx2 = final_bbox
+                    if side == 'left':
+                        safe_limit = max(0, bx1 - self.SAFE_MARGIN_HORIZONTAL)
+                        crop[side] = min(detected_border, safe_limit)
+                    else:
+                        safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
+                        crop[side] = min(detected_border, safe_limit)
+                    logger.info(f"{side}: pure border, crop={crop[side]} (safe_limit={safe_limit})")
+                else:
+                    crop[side] = detected_border
+            else:
+                logger.info(f"{side}: not pure border or no border detected")
+                crop[side] = 0
+
+        # 4. Анализируем верх/низ
+        top_type = self._analyze_edge_strip_gpu(img_gpu, 'top')
+        bottom_type = self._analyze_edge_strip_gpu(img_gpu, 'bottom')
 
         logger.info(f"Edge types: top={top_type}, bottom={bottom_type}")
         logger.info(f"Detected borders: left={crop['left']}, right={crop['right']}")
 
-        top_border = self._detect_border(img, 'top', sensitivity, min_border_size)
-        bottom_border = self._detect_border(img, 'bottom', sensitivity, min_border_size)
+        top_border = self._detect_border_gpu(img_gpu, 'top', sensitivity, min_border_size)
+        bottom_border = self._detect_border_gpu(img_gpu, 'bottom', sensitivity, min_border_size)
 
-        if content_bbox:
-            cy1, cy2, cx1, cx2 = content_bbox
-            safe_top = max(0, cy1 - self.SAFE_MARGIN)
-            safe_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
+        if final_bbox:
+            by1, by2, bx1, bx2 = final_bbox
+            safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
+            safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
-            # Сверху
             if top_border > safe_top:
                 if top_type == 'uniform':
-                    # Заливаем safe zone цветом фона
-                    fill_color = self._get_border_color(img, 'top')
-                    img[safe_top:top_border, :] = fill_color
+                    fill_color = self._get_border_color_gpu(img_gpu, 'top')
+                    img_gpu[safe_top:top_border, :, :3] = fill_color
                     crop['top'] = top_border
-                    logger.info(f"Top: uniform, filled {safe_top}-{top_border} with color, crop={top_border}")
+                    logger.info(f"Top: uniform, filled {safe_top}-{top_border} with {fill_color.cpu().numpy()}, crop={top_border}")
                 elif top_type == 'dynamic':
                     crop['top'] = top_border
                     logger.info(f"Top: dynamic edge, full crop={top_border}")
                 else:
-                    # Mixed — нужен LaMa
                     need_lama = True
                     crop['top'] = safe_top
                     logger.info(f"Top: mixed, crop to safe={safe_top}, LaMa needed")
             else:
                 crop['top'] = top_border
 
-            # Снизу
             if bottom_border > safe_bottom:
                 if bottom_type == 'uniform':
-                    fill_color = self._get_border_color(img, 'bottom')
-                    img[h-bottom_border:h-safe_bottom, :] = fill_color
+                    fill_color = self._get_border_color_gpu(img_gpu, 'bottom')
+                    img_gpu[h-bottom_border:h-safe_bottom, :, :3] = fill_color
                     crop['bottom'] = bottom_border
-                    logger.info(f"Bottom: uniform, filled, crop={bottom_border}")
+                    logger.info(f"Bottom: uniform, filled with {fill_color.cpu().numpy()}, crop={bottom_border}")
                 elif bottom_type == 'dynamic':
                     crop['bottom'] = bottom_border
                     logger.info(f"Bottom: dynamic edge, full crop={bottom_border}")
@@ -108,160 +372,152 @@ class AutoBorderCrop:
             crop['top'] = top_border
             crop['bottom'] = bottom_border
 
-        # Применяем LaMa если нужно
-        if need_lama and content_bbox:
-            img = self._apply_lama_to_borders(img, crop, content_bbox, top_type, bottom_type)
+        if need_lama and final_bbox:
+            img_gpu = self._apply_lama_to_borders_gpu(img_gpu, crop, final_bbox, top_type, bottom_type)
 
         logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
-        # Проверка что осталось достаточно контента
-        if (h - crop['top'] - crop['bottom']) < h * 0.3 or (w - crop['left'] - crop['right']) < w * 0.3:
-            return (image[0:1],)
+        new_h = h - crop['top'] - crop['bottom']
+        new_w = w - crop['left'] - crop['right']
 
-        y1, y2 = crop['top'], h - crop['bottom'] if crop['bottom'] > 0 else h
-        x1, x2 = crop['left'], w - crop['right'] if crop['right'] > 0 else w
+        if new_h < h * self.MIN_CONTENT_RATIO or new_w < w * self.MIN_CONTENT_RATIO:
+            return (img_gpu / 255.0).clamp(0, 1).cpu()
+
+        y1 = crop['top']
+        y2 = h - crop['bottom'] if crop['bottom'] > 0 else h
+        x1 = crop['left']
+        x2 = w - crop['right'] if crop['right'] > 0 else w
 
         if y1 >= y2 or x1 >= x2:
-            return (image[0:1],)
+            return (img_gpu / 255.0).clamp(0, 1).cpu()
 
-        # Возвращаем обработанное изображение
-        result = torch.from_numpy(img[y1:y2, x1:x2, :].astype(np.float32) / 255.0).unsqueeze(0)
-        return (result,)
+        result = (img_gpu[y1:y2, x1:x2] / 255.0).clamp(0, 1).cpu()
+        return result
 
-    def _get_border_color(self, img: np.ndarray, side: str) -> np.ndarray:
-        """Получает цвет рамки для заливки."""
+    def _get_border_color_gpu(self, img: torch.Tensor, side: str) -> torch.Tensor:
+        """Получает РЕАЛЬНЫЙ цвет рамки для заливки на GPU (без нормализации)."""
         h, w = img.shape[:2]
+        sample_size = 10
+
         if side == 'top':
-            sample = img[0:10, :, :3]
+            sample = img[0:sample_size, :, :3]
         else:
-            sample = img[h-10:h, :, :3]
+            sample = img[h-sample_size:h, :, :3]
 
-        median = np.median(sample.reshape(-1, 3), axis=0)
+        pixels = sample.reshape(-1, 3)
+        median = pixels.median(dim=0).values
+        # Возвращаем реальный цвет БЕЗ нормализации к чёрному/белому
+        return median
 
-        if median.mean() < 40:
-            return np.array([0, 0, 0], dtype=np.uint8)
-        elif median.mean() > 215:
-            return np.array([255, 255, 255], dtype=np.uint8)
-        return median.astype(np.uint8)
-
-    def _apply_lama_to_borders(self, img: np.ndarray, crop: dict, content_bbox: tuple, top_type: str, bottom_type: str) -> np.ndarray:
+    def _apply_lama_to_borders_gpu(self, img_gpu: torch.Tensor, crop: dict, content_bbox: tuple, top_type: str, bottom_type: str) -> torch.Tensor:
         """Применяет LaMa для mixed областей."""
         try:
             from simple_lama_inpainting import SimpleLama
             from PIL import Image
 
-            h, w = img.shape[:2]
-            cy1, cy2, cx1, cx2 = content_bbox
-            mask = np.zeros((h, w), dtype=np.uint8)
+            h, w = img_gpu.shape[:2]
+            by1, by2, bx1, bx2 = content_bbox
 
-            # Маска для mixed областей
+            mask_gpu = torch.zeros(h, w, device=img_gpu.device, dtype=torch.uint8)
+
             if top_type == 'mixed':
-                top_border = self._detect_border(img, 'top', 15, 5)
-                safe_top = max(0, cy1 - self.SAFE_MARGIN)
+                top_border = self._detect_border_gpu(img_gpu, 'top', 15, 5)
+                safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
                 if top_border > safe_top:
-                    mask[safe_top:top_border, :] = 255
+                    mask_gpu[safe_top:top_border, :] = 255
 
             if bottom_type == 'mixed':
-                bottom_border = self._detect_border(img, 'bottom', 15, 5)
-                safe_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
+                bottom_border = self._detect_border_gpu(img_gpu, 'bottom', 15, 5)
+                safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
                 if bottom_border > safe_bottom:
-                    mask[h-bottom_border:h-safe_bottom, :] = 255
+                    mask_gpu[h-bottom_border:h-safe_bottom, :] = 255
 
-            if mask.max() == 0:
-                return img
+            if mask_gpu.max() == 0:
+                return img_gpu
 
             logger.info("Applying LaMa for mixed border areas")
+
+            img_np = img_gpu.cpu().numpy().astype(np.uint8)
+            mask_np = mask_gpu.cpu().numpy()
+
             lama = SimpleLama()
-            result = lama(Image.fromarray(img), Image.fromarray(mask))
-            return np.array(result)
+            result = lama(Image.fromarray(img_np), Image.fromarray(mask_np))
+
+            return torch.from_numpy(np.array(result)).float().to(img_gpu.device)
 
         except Exception as e:
             logger.warning(f"LaMa failed: {e}")
-            return img
+            return img_gpu
 
-    def _analyze_edge_strip(self, img: np.ndarray, side: str) -> str:
-        """Анализирует полосу с края: uniform, dynamic, mixed."""
+    def _analyze_edge_strip_gpu(self, img: torch.Tensor, side: str) -> str:
+        """Анализирует полосу с края на GPU: uniform, dynamic, mixed."""
         h, w = img.shape[:2]
-        edge_size = 30
 
         if side == 'top':
-            strip = img[0:edge_size, :, :3]
+            strip = img[0:self.EDGE_SIZE, :, :3]
         elif side == 'bottom':
-            strip = img[h-edge_size:h, :, :3]
+            strip = img[h-self.EDGE_SIZE:h, :, :3]
         elif side == 'left':
-            strip = img[:, 0:edge_size, :3]
+            strip = img[:, 0:self.EDGE_SIZE, :3]
         else:
-            strip = img[:, w-edge_size:w, :3]
+            strip = img[:, w-self.EDGE_SIZE:w, :3]
 
-        pixels = strip.reshape(-1, 3).astype(np.float32)
-        std = np.std(pixels, axis=0).mean()
-        median = np.median(pixels, axis=0)
-        saturation = max(median) - min(median)
+        pixels = strip.reshape(-1, 3).float()
+        std = pixels.std(dim=0).mean().item()
+        median = pixels.median(dim=0).values
+        saturation = (median.max() - median.min()).item()
 
-        if std < 15 and saturation < 30:
+        if std < self.UNIFORM_STD_THRESHOLD and saturation < self.SATURATION_THRESHOLD:
             return 'uniform'
-        elif std > 40:
+        elif std > self.DYNAMIC_STD_THRESHOLD:
             return 'dynamic'
         else:
             return 'mixed'
 
-    def _find_content_bbox(self, img: np.ndarray) -> tuple:
-        """Находит bbox контента (не чёрное/белое/серое)."""
+    def _find_content_bbox_gpu(self, img: torch.Tensor) -> Optional[Tuple[int, int, int, int]]:
+        """Находит bbox контента на GPU (не чёрное/белое/серое)."""
         h, w = img.shape[:2]
 
-        # Конвертируем в grayscale
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        if img.shape[2] >= 3:
+            gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
         else:
-            gray = img
+            gray = img[:, :, 0]
 
-        # Маска: не слишком тёмное и не слишком светлое
-        # Чёрное < 30, белое > 225
-        content_mask = ((gray > 30) & (gray < 225)).astype(np.uint8)
+        content_mask = ((gray > self.BLACK_THRESHOLD) & (gray < self.WHITE_THRESHOLD)).float()
 
-        # Также проверяем насыщенность (цветное = контент)
-        if len(img.shape) == 3:
-            max_ch = np.max(img, axis=2)
-            min_ch = np.min(img, axis=2)
-            saturation = max_ch.astype(np.int16) - min_ch.astype(np.int16)
-            color_mask = (saturation > 20).astype(np.uint8)
-            content_mask = np.maximum(content_mask, color_mask)
+        if img.shape[2] >= 3:
+            max_ch = img[:, :, :3].max(dim=2).values
+            min_ch = img[:, :, :3].min(dim=2).values
+            saturation = max_ch - min_ch
+            color_mask = (saturation > self.COLOR_SATURATION_THRESHOLD).float()
+            content_mask = torch.maximum(content_mask, color_mask)
 
-        # Морфология для удаления шума
-        kernel = np.ones((5, 5), np.uint8)
-        content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_OPEN, kernel)
-        content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, kernel)
+        content_mask = _morphology_open_close_gpu(content_mask, kernel_size=5)
 
-        # Находим bbox контента
-        coords = np.where(content_mask > 0)
+        coords = torch.where(content_mask > 0.5)
         if len(coords[0]) == 0:
             return None
 
-        y1, y2 = coords[0].min(), coords[0].max()
-        x1, x2 = coords[1].min(), coords[1].max()
+        y1 = coords[0].min().item()
+        y2 = coords[0].max().item()
+        x1 = coords[1].min().item()
+        x2 = coords[1].max().item()
 
         return (y1, y2, x1, x2)
 
-    def _is_grayscale_color(self, rgb: np.ndarray, saturation_threshold: float = 30.0) -> bool:
-        """Проверяет, является ли цвет оттенком серого."""
-        r, g, b = rgb[0], rgb[1], rgb[2]
-        saturation = max(r, g, b) - min(r, g, b)
-        return saturation < saturation_threshold
+    def _is_grayscale_color_gpu(self, rgb: torch.Tensor) -> bool:
+        """Проверяет, является ли цвет оттенком серого на GPU."""
+        saturation = rgb.max() - rgb.min()
+        return saturation.item() < self.SATURATION_THRESHOLD
 
-    def _detect_border(self, img, side, sensitivity, min_size):
-        """Двойной проход: сначала полосы, потом углы."""
-        h, w = img.shape[:2]
-
-        # Проход 1: полосы по всей стороне
-        border_pass1 = self._detect_border_by_lines(img, side, sensitivity, min_size)
-
-        # Проход 2: проверка угла после первого прохода
-        border_pass2 = self._detect_border_by_corner(img, side, sensitivity, min_size, border_pass1)
-
+    def _detect_border_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int) -> int:
+        """Двойной проход детекции рамки на GPU."""
+        border_pass1 = self._detect_border_by_lines_gpu(img, side, sensitivity, min_size)
+        border_pass2 = self._detect_border_by_corner_gpu(img, side, sensitivity, min_size, border_pass1)
         return max(border_pass1, border_pass2)
 
-    def _detect_border_by_lines(self, img, side, sensitivity, min_size):
-        """Проход 1: детекция по полным линиям."""
+    def _detect_border_by_lines_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int) -> int:
+        """Проход 1: детекция по полным линиям на GPU."""
         h, w = img.shape[:2]
 
         if side == 'top':
@@ -277,24 +533,20 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w-1-i, :3]
             max_scan = w // 2
 
-        # Референсный цвет из первых линий
         sample_lines = min(5, max_scan)
-        sample_pixels = []
-        for i in range(sample_lines):
-            sample_pixels.append(get_line(i))
-        sample = np.vstack(sample_pixels).astype(np.float32)
-        ref_color = np.median(sample, axis=0)
+        sample_pixels = torch.cat([get_line(i) for i in range(sample_lines)], dim=0).float()
+        ref_color = sample_pixels.median(dim=0).values
 
-        if not self._is_grayscale_color(ref_color):
+        if not self._is_grayscale_color_gpu(ref_color):
             return 0
 
         border = 0
         for i in range(max_scan):
-            line = get_line(i).astype(np.float32)
-            line_median = np.median(line, axis=0)
+            line = get_line(i).float()
+            line_median = line.median(dim=0).values
 
-            if self._is_grayscale_color(line_median):
-                diff = np.abs(line_median - ref_color).mean()
+            if self._is_grayscale_color_gpu(line_median):
+                diff = (line_median - ref_color).abs().mean().item()
                 if diff < sensitivity:
                     border = i + 1
                 else:
@@ -304,12 +556,11 @@ class AutoBorderCrop:
 
         return border if border >= min_size else 0
 
-    def _detect_border_by_corner(self, img, side, sensitivity, min_size, start_offset):
-        """Проход 2: проверка угла — если там ещё серое, дорезаем."""
+    def _detect_border_by_corner_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int, start_offset: int) -> int:
+        """Проход 2: проверка угла на GPU."""
         h, w = img.shape[:2]
-        corner_size = min(100, h // 4, w // 4)
+        corner_size = min(self.MAX_CORNER_SIZE, h // self.CORNER_SIZE_RATIO, w // self.CORNER_SIZE_RATIO)
 
-        # Берём угол с учётом уже срезанного
         if side == 'top':
             y_start = start_offset
             corner = img[y_start:y_start+corner_size, 0:corner_size, :3]
@@ -331,22 +582,22 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w-1-start_offset-i, :3]
             max_scan = w // 2 - start_offset
 
-        if corner.size == 0 or max_scan <= 0:
+        if corner.numel() == 0 or max_scan <= 0:
             return 0
 
-        ref_color = np.median(corner.reshape(-1, 3).astype(np.float32), axis=0)
+        ref_color = corner.reshape(-1, 3).float().median(dim=0).values
 
-        if not self._is_grayscale_color(ref_color):
+        if not self._is_grayscale_color_gpu(ref_color):
             return 0
 
         extra_border = 0
         for i in range(max_scan):
-            line = get_line(i).astype(np.float32)
-            line_median = np.median(line, axis=0)
+            line = get_line(i).float()
+            line_median = line.median(dim=0).values
 
-            if self._is_grayscale_color(line_median):
-                diff = np.abs(line_median - ref_color).mean()
-                if diff < sensitivity * 1.5:  # Чуть мягче для второго прохода
+            if self._is_grayscale_color_gpu(line_median):
+                diff = (line_median - ref_color).abs().mean().item()
+                if diff < sensitivity * self.SECOND_PASS_SENSITIVITY_MULTIPLIER:
                     extra_border = i + 1
                 else:
                     break
@@ -359,11 +610,24 @@ class AutoBorderCrop:
 
 class SmartScreenshotCleaner:
     """
-    Находит UI элементы и заливает их цветом окружения.
-    Если ничего не найдено — пропускает без обработки.
+    Находит UI элементы и заливает их РЕАЛЬНЫМ цветом окружения.
+    Комбинирует YOLO детекцию + детекцию ярких мелких элементов (точки, иконки).
+    Полностью GPU-ускоренная версия.
     """
 
-    yolo_model = None
+    _yolo_model = None
+    _model_device = None
+
+    MAX_BOX_RATIO = 0.1
+    UNIFORM_BACKGROUND_THRESHOLD = 25.0
+    SURROUNDING_MARGIN = 10
+
+    # Параметры для детекции ярких UI элементов (жёлтые точки, иконки и т.д.)
+    BRIGHT_YELLOW_MIN = (200, 180, 0)    # Минимальный RGB для жёлтого
+    BRIGHT_YELLOW_MAX = (255, 255, 100)  # Максимальный RGB для жёлтого
+    MIN_BLOB_SIZE = 5                     # Минимальный размер элемента в пикселях
+    MAX_BLOB_SIZE = 100                   # Максимальный размер (не UI если больше)
+    BLOB_EXPAND_MARGIN = 3                # Расширение области вокруг найденного блоба
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -382,7 +646,7 @@ class SmartScreenshotCleaner:
     def __init__(self):
         self.device = get_device()
 
-    def _get_models_dir(self):
+    def _get_models_dir(self) -> str:
         try:
             import folder_paths
             d = os.path.join(folder_paths.models_dir, "screenshot_cleaner")
@@ -391,123 +655,238 @@ class SmartScreenshotCleaner:
         os.makedirs(d, exist_ok=True)
         return d
 
+    @classmethod
+    def unload_model(cls):
+        """Освобождает память GPU от модели YOLO."""
+        if cls._yolo_model is not None:
+            del cls._yolo_model
+            cls._yolo_model = None
+            cls._model_device = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("YOLO model unloaded")
+
     def _load_yolo(self):
-        if SmartScreenshotCleaner.yolo_model is not None:
-            return SmartScreenshotCleaner.yolo_model
+        current_device = self.device
+
+        if SmartScreenshotCleaner._yolo_model is not None:
+            if SmartScreenshotCleaner._model_device == current_device:
+                return SmartScreenshotCleaner._yolo_model
+            else:
+                self.unload_model()
+
         try:
             from ultralytics import YOLO
             from huggingface_hub import hf_hub_download
-            path = hf_hub_download("microsoft/OmniParser-v2.0", "icon_detect/model.pt", cache_dir=self._get_models_dir())
-            SmartScreenshotCleaner.yolo_model = YOLO(path)
-            if self.device.type == "cuda":
-                SmartScreenshotCleaner.yolo_model.to(self.device)
-            logger.info("YOLO loaded")
-            return SmartScreenshotCleaner.yolo_model
+
+            path = hf_hub_download(
+                "microsoft/OmniParser-v2.0",
+                "icon_detect/model.pt",
+                cache_dir=self._get_models_dir()
+            )
+
+            SmartScreenshotCleaner._yolo_model = YOLO(path)
+
+            if current_device.type in ("cuda", "mps"):
+                SmartScreenshotCleaner._yolo_model.to(current_device)
+
+            SmartScreenshotCleaner._model_device = current_device
+            logger.info(f"YOLO loaded on {current_device}")
+            return SmartScreenshotCleaner._yolo_model
+
         except Exception as e:
             logger.error(f"YOLO error: {e}")
             return None
 
-    def _get_surrounding_color(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int, margin: int = 10) -> np.ndarray:
-        """Получает цвет пикселей вокруг области. Если чёрное — чёрный, белое — белый."""
+    def _is_uniform_background_gpu(self, img: torch.Tensor, x1: int, y1: int, x2: int, y2: int) -> bool:
+        """Проверяет однотонность фона вокруг области на GPU."""
         h, w = img.shape[:2]
-        pixels = []
-
-        if y1 > 0:
-            pixels.append(img[max(0, y1-margin):y1, x1:x2].reshape(-1, 3))
-        if y2 < h:
-            pixels.append(img[y2:min(h, y2+margin), x1:x2].reshape(-1, 3))
-        if x1 > 0:
-            pixels.append(img[y1:y2, max(0, x1-margin):x1].reshape(-1, 3))
-        if x2 < w:
-            pixels.append(img[y1:y2, x2:min(w, x2+margin)].reshape(-1, 3))
-
-        if not pixels:
-            return np.array([128, 128, 128], dtype=np.uint8)
-
-        all_pixels = np.concatenate(pixels, axis=0)
-        median_color = np.median(all_pixels, axis=0)
-
-        # Если почти чёрное (< 40) — делаем чисто чёрным
-        if median_color.mean() < 40:
-            return np.array([0, 0, 0], dtype=np.uint8)
-
-        # Если почти белое (> 215) — делаем чисто белым
-        if median_color.mean() > 215:
-            return np.array([255, 255, 255], dtype=np.uint8)
-
-        return median_color.astype(np.uint8)
-
-    def _is_uniform_background(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int, threshold: float = 25.0) -> bool:
-        """Проверяет однотонность фона вокруг области."""
-        h, w = img.shape[:2]
-        margin = 10
+        margin = self.SURROUNDING_MARGIN
         pixels = []
 
         if y1 > margin:
-            pixels.append(img[y1-margin:y1, x1:x2].reshape(-1, 3))
+            pixels.append(img[y1-margin:y1, x1:x2, :3].reshape(-1, 3))
         if y2 < h - margin:
-            pixels.append(img[y2:y2+margin, x1:x2].reshape(-1, 3))
+            pixels.append(img[y2:y2+margin, x1:x2, :3].reshape(-1, 3))
         if x1 > margin:
-            pixels.append(img[y1:y2, x1-margin:x1].reshape(-1, 3))
+            pixels.append(img[y1:y2, x1-margin:x1, :3].reshape(-1, 3))
         if x2 < w - margin:
-            pixels.append(img[y1:y2, x2:x2+margin].reshape(-1, 3))
+            pixels.append(img[y1:y2, x2:x2+margin, :3].reshape(-1, 3))
 
         if not pixels:
             return False
 
-        all_pixels = np.concatenate(pixels, axis=0).astype(np.float32)
-        std = np.std(all_pixels, axis=0).mean()
-        return std < threshold
+        all_pixels = torch.cat(pixels, dim=0).float()
+        std = all_pixels.std(dim=0).mean()
+        return std.item() < self.UNIFORM_BACKGROUND_THRESHOLD
+
+    def _detect_bright_ui_elements_gpu(self, img: torch.Tensor) -> torch.Tensor:
+        """Детектирует яркие UI элементы (жёлтые точки, иконки) на GPU.
+        Возвращает маску найденных элементов."""
+        h, w = img.shape[:2]
+        device = img.device
+
+        # Детектируем жёлтые элементы (индикаторы Instagram и т.д.)
+        r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+
+        # Жёлтый: высокий R, высокий G, низкий B
+        yellow_mask = (
+            (r > self.BRIGHT_YELLOW_MIN[0]) & (r < self.BRIGHT_YELLOW_MAX[0]) &
+            (g > self.BRIGHT_YELLOW_MIN[1]) & (g < self.BRIGHT_YELLOW_MAX[1]) &
+            (b > self.BRIGHT_YELLOW_MIN[2]) & (b < self.BRIGHT_YELLOW_MAX[2])
+        ).float()
+
+        # Детектируем белые мелкие элементы (иконки)
+        white_mask = (
+            (r > 240) & (g > 240) & (b > 240)
+        ).float()
+
+        # Детектируем ярко-красные элементы (сердечки, уведомления)
+        red_mask = (
+            (r > 200) & (g < 100) & (b < 100)
+        ).float()
+
+        # Объединяем маски
+        combined_mask = torch.maximum(yellow_mask, torch.maximum(white_mask, red_mask))
+
+        if combined_mask.sum() == 0:
+            return torch.zeros(h, w, device=device)
+
+        # Морфология: расширяем найденные области
+        mask_4d = combined_mask.unsqueeze(0).unsqueeze(0)
+        # Dilate чтобы объединить близкие пиксели
+        dilated = F.max_pool2d(mask_4d, kernel_size=5, stride=1, padding=2)
+        # Erode чтобы убрать шум
+        eroded = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+
+        return eroded.squeeze(0).squeeze(0)
+
+    def _find_connected_components_gpu(self, mask: torch.Tensor, min_size: int, max_size: int) -> List[Tuple[int, int, int, int]]:
+        """Находит связные компоненты в маске и возвращает их bbox'ы.
+        Фильтрует по размеру."""
+        if mask.sum() == 0:
+            return []
+
+        # Переносим на CPU для поиска компонент (GPU версия сложнее)
+        mask_np = (mask > 0.5).cpu().numpy().astype(np.uint8)
+
+        # Простой поиск через connected components
+        from scipy import ndimage
+        labeled, num_features = ndimage.label(mask_np)
+
+        boxes = []
+        for i in range(1, num_features + 1):
+            coords = np.where(labeled == i)
+            if len(coords[0]) == 0:
+                continue
+
+            y1, y2 = coords[0].min(), coords[0].max()
+            x1, x2 = coords[1].min(), coords[1].max()
+
+            area = (y2 - y1 + 1) * (x2 - x1 + 1)
+
+            if min_size <= area <= max_size * max_size:
+                # Расширяем bbox
+                margin = self.BLOB_EXPAND_MARGIN
+                h, w = mask_np.shape
+                y1 = max(0, y1 - margin)
+                y2 = min(h, y2 + margin)
+                x1 = max(0, x1 - margin)
+                x2 = min(w, x2 + margin)
+                boxes.append((x1, y1, x2, y2))
+
+        return boxes
 
     @torch.no_grad()
     def process(self, image: torch.Tensor, confidence: float = 0.2):
+        if image.shape[0] == 0:
+            return (image, torch.zeros(0, 1, 1, device=image.device))
+
+        batch_size = image.shape[0]
         h, w = image.shape[1], image.shape[2]
 
         model = self._load_yolo()
         if model is None:
-            return (image[0:1], torch.zeros(1, h, w))
+            empty_mask = torch.zeros(batch_size, h, w, device=image.device)
+            return (image, empty_mask)
 
-        img = image[0].cpu().numpy()
-        img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        all_results = []
+        all_masks = []
 
-        results = model.predict(img_uint8, conf=confidence, verbose=False, device=self.device, imgsz=640)
+        for batch_idx in range(batch_size):
+            single_img = image[batch_idx]
+            result_img, result_mask = self._process_single_image(single_img, model, confidence)
+            all_results.append(result_img)
+            all_masks.append(result_mask)
 
-        boxes = []
-        for result in results:
-            if result.boxes is None:
-                continue
-            for i in range(len(result.boxes)):
-                box = result.boxes.xyxy[i].cpu().numpy().astype(int)
-                x1, y1, x2, y2 = box
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                if x2 > x1 and y2 > y1:
-                    boxes.append((x1, y1, x2, y2))
+        out_images = torch.stack(all_results)
+        out_masks = torch.stack(all_masks)
 
-        if not boxes:
+        return (out_images, out_masks)
+
+    def _process_single_image(self, img: torch.Tensor, model, confidence: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Обрабатывает одно изображение на GPU.
+        Комбинирует YOLO детекцию + детекцию ярких элементов."""
+        device = self.device
+        h, w = img.shape[:2]
+
+        img_gpu = img.to(device)
+        img_uint8_gpu = (img_gpu.clamp(0, 1) * 255).to(torch.uint8)
+
+        img_np = img_uint8_gpu.cpu().numpy()
+
+        # 1. YOLO детекция (OmniParser для десктопных UI)
+        boxes: List[Tuple[int, int, int, int]] = []
+        if model is not None:
+            results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=640)
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for i in range(len(result.boxes)):
+                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
+                    x1, y1, x2, y2 = box
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+                    if x2 > x1 and y2 > y1:
+                        boxes.append((x1, y1, x2, y2))
+
+        logger.info(f"YOLO detected: {len(boxes)} UI elements")
+
+        # 2. Детекция ярких UI элементов (жёлтые точки, иконки Instagram и т.д.)
+        bright_mask = self._detect_bright_ui_elements_gpu(img_uint8_gpu.float())
+        bright_boxes = self._find_connected_components_gpu(
+            bright_mask,
+            min_size=self.MIN_BLOB_SIZE,
+            max_size=self.MAX_BLOB_SIZE
+        )
+        logger.info(f"Color detected: {len(bright_boxes)} bright UI elements")
+
+        # Объединяем все боксы
+        all_boxes = boxes + bright_boxes
+
+        if not all_boxes:
             logger.info("No UI elements detected, returning original")
-            return (image[0:1], torch.zeros(1, h, w))
+            return img, torch.zeros(h, w, device=device)
 
-        logger.info(f"UI elements detected: {len(boxes)}")
+        logger.info(f"Total UI elements: {len(all_boxes)}")
 
-        ui_mask = np.zeros((h, w), dtype=np.float32)
-        processed = img_uint8.copy()
+        ui_mask = torch.zeros(h, w, device=device, dtype=torch.float32)
+        processed = img_uint8_gpu.clone().float()
+        img_area = h * w
 
-        for x1, y1, x2, y2 in boxes:
-            # Пропускаем слишком большие боксы (> 10% картинки) — это не UI элемент
+        for x1, y1, x2, y2 in all_boxes:
             box_area = (x2 - x1) * (y2 - y1)
-            img_area = h * w
-            if box_area > img_area * 0.1:
+            if box_area > img_area * self.MAX_BOX_RATIO:
                 logger.info(f"Skipping large box {x1},{y1}-{x2},{y2}: {box_area/img_area*100:.1f}% of image")
                 continue
 
             ui_mask[y1:y2, x1:x2] = 1.0
-            if self._is_uniform_background(img_uint8, x1, y1, x2, y2):
-                color = self._get_surrounding_color(img_uint8, x1, y1, x2, y2)
-                processed[y1:y2, x1:x2] = color
-                logger.info(f"Filled UI box {x1},{y1}-{x2},{y2} with color {color}")
 
-        out_img = torch.from_numpy(processed.astype(np.float32) / 255.0).unsqueeze(0)
-        out_mask = torch.from_numpy(ui_mask).unsqueeze(0)
+            # Всегда заливаем цветом окружения
+            color = _get_surrounding_color_gpu(img_uint8_gpu.float(), x1, y1, x2, y2, self.SURROUNDING_MARGIN)
+            processed[y1:y2, x1:x2, :3] = color
+            logger.info(f"Filled UI box {x1},{y1}-{x2},{y2} with color {color.cpu().numpy()}")
 
-        return (out_img, out_mask)
+        out_img = (processed / 255.0).clamp(0, 1)
+
+        return out_img.cpu(), ui_mask.cpu()
