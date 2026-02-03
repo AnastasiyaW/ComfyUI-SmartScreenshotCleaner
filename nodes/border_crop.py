@@ -924,6 +924,10 @@ class SmartScreenshotCleaner:
     YOLO_IMGSZ = 1280             # Разрешение для YOLO
     IOU_THRESHOLD = 0.5           # Порог IoU для дедупликации боксов
 
+    # Зоны UI (доля изображения от края)
+    UI_EDGE_ZONE = 0.25           # 25% от края считается UI зоной
+    UI_CENTER_SAFE_ZONE = 0.4     # Центральные 40% защищены от детекции текста
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1075,6 +1079,56 @@ class SmartScreenshotCleaner:
 
         return keep
 
+    def _is_ui_zone(self, x1: int, y1: int, x2: int, y2: int, img_w: int, img_h: int, model_name: str) -> bool:
+        """Проверяет, находится ли бокс в UI зоне (края изображения).
+
+        Для моделей детекции текста (icon_caption) — строгая фильтрация:
+        текст принимается только если он находится на краях изображения.
+
+        Для icon_detect и YOLO — принимаем всё (они уже обучены на UI).
+        """
+        # icon_detect и YOLO обучены на UI элементах — принимаем всё
+        if model_name != "omniparser_caption":
+            return True
+
+        # Для icon_caption — фильтруем текст в центре изображения
+        box_center_x = (x1 + x2) / 2
+        box_center_y = (y1 + y2) / 2
+
+        # Границы центральной "безопасной" зоны
+        safe_left = img_w * self.UI_CENTER_SAFE_ZONE
+        safe_right = img_w * (1 - self.UI_CENTER_SAFE_ZONE)
+        safe_top = img_h * self.UI_CENTER_SAFE_ZONE
+        safe_bottom = img_h * (1 - self.UI_CENTER_SAFE_ZONE)
+
+        # Если центр бокса в безопасной зоне — это скорее всего контент, не UI
+        if safe_left < box_center_x < safe_right and safe_top < box_center_y < safe_bottom:
+            # Дополнительная проверка: маленький текст в центре может быть watermark
+            box_area = (x2 - x1) * (y2 - y1)
+            img_area = img_w * img_h
+            if box_area / img_area < 0.01:  # Очень маленький текст (< 1%) — может быть watermark
+                return True
+            logger.debug(f"Skipping text in center: {x1},{y1}-{x2},{y2}")
+            return False
+
+        return True
+
+    def _is_in_ui_panel(self, x1: int, y1: int, x2: int, y2: int, img_w: int, img_h: int) -> bool:
+        """Проверяет, находится ли бокс в типичной UI панели (справа, снизу, сверху)."""
+        # Правая панель (Instagram comments обычно справа)
+        if x1 > img_w * 0.5:
+            return True
+
+        # Верхняя панель (status bar, навигация)
+        if y2 < img_h * self.UI_EDGE_ZONE:
+            return True
+
+        # Нижняя панель (комментарии, лайки, навигация)
+        if y1 > img_h * (1 - self.UI_EDGE_ZONE):
+            return True
+
+        return False
+
     @torch.no_grad()
     def process(self, image: torch.Tensor, confidence: float = 0.1):
         """
@@ -1147,6 +1201,7 @@ class SmartScreenshotCleaner:
                     )
 
                 model_boxes = 0
+                skipped_center = 0
                 for result in results:
                     if result.boxes is None:
                         continue
@@ -1156,10 +1211,17 @@ class SmartScreenshotCleaner:
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(w, x2), min(h, y2)
                         if x2 > x1 and y2 > y1:
-                            all_boxes.append((x1, y1, x2, y2))
-                            model_boxes += 1
+                            # Фильтруем текст в центре (только для icon_caption)
+                            if self._is_ui_zone(x1, y1, x2, y2, w, h, model_name):
+                                all_boxes.append((x1, y1, x2, y2))
+                                model_boxes += 1
+                            else:
+                                skipped_center += 1
 
-                logger.info(f"{model_name} detected: {model_boxes} elements")
+                if skipped_center > 0:
+                    logger.info(f"{model_name} detected: {model_boxes} UI elements (skipped {skipped_center} in center)")
+                else:
+                    logger.info(f"{model_name} detected: {model_boxes} UI elements")
 
             except Exception as e:
                 logger.warning(f"{model_name} failed: {e}")
