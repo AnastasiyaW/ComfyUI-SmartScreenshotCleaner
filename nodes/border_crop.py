@@ -4,7 +4,18 @@ import torchvision.transforms.functional as TF
 import numpy as np
 import os
 import logging
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
+from pathlib import Path
+
+# LaMa import with availability check
+try:
+    from simple_lama_inpainting import SimpleLama
+    from PIL import Image
+    HAS_LAMA = True
+except ImportError:
+    HAS_LAMA = False
+    SimpleLama = None
+    Image = None
 
 logger = logging.getLogger("HappyIn")
 if not logger.handlers:
@@ -106,20 +117,38 @@ class AutoBorderCrop:
     """Обрезает однотонные чёрные/белые/серые рамки с краёв изображения.
     Использует YOLO для детекции людей и построения safe bbox."""
 
-    # Константы класса
+    # Константы класса — Safe margins
     SAFE_MARGIN_VERTICAL = 50      # Отступ сверху/снизу от контента
     SAFE_MARGIN_HORIZONTAL = 200   # Большой отступ слева/справа (защита рук)
+
+    # Константы — Edge detection
     EDGE_SIZE = 30
     CORNER_SIZE_RATIO = 4
     MAX_CORNER_SIZE = 100
-    UNIFORM_STD_THRESHOLD = 15.0
-    DYNAMIC_STD_THRESHOLD = 40.0
-    SATURATION_THRESHOLD = 30.0
-    MIN_CONTENT_RATIO = 0.3
-    SECOND_PASS_SENSITIVITY_MULTIPLIER = 1.5
-    BLACK_THRESHOLD = 30
-    WHITE_THRESHOLD = 225
+    CHECK_DEPTH = 20               # Глубина проверки границы (пикселей)
+    LOOKAHEAD_PIXELS = 30          # Смотрим вперёд для проверки контента
+
+    # Константы — Thresholds
+    UNIFORM_STD_THRESHOLD = 15.0   # Ниже = чистый однотонный фон
+    AMBIGUOUS_STD_LOW = 15.0       # Нижний порог неоднозначной зоны
+    AMBIGUOUS_STD_HIGH = 40.0      # Верхний порог неоднозначной зоны
+    DYNAMIC_STD_THRESHOLD = 50.0   # Выше = высокая динамика (контент)
+    CONTENT_STD_THRESHOLD = 40.0   # Порог для проверки контента
+    SEGMENT_STD_THRESHOLD = 20.0   # Порог динамики сегмента линии
+
+    # Константы — Color detection
+    SATURATION_THRESHOLD = 30.0    # Порог насыщенности для цветного контента
+    BLACK_THRESHOLD = 30           # Ниже = чёрный фон
+    WHITE_THRESHOLD = 225          # Выше = белый фон
     COLOR_SATURATION_THRESHOLD = 20
+    COLORFUL_RATIO_THRESHOLD = 0.2 # 20% цветных пикселей = цветной контент
+    HIGH_DYNAMICS_STD = 50.0       # STD для игнорирования safe space
+
+    # Константы — Limits
+    MIN_CONTENT_RATIO = 0.3        # Минимум 30% контента после обрезки
+    MIN_COVERAGE = 0.7             # Минимум 70% покрытия для контента
+    CONTENT_CONTINUE_RATIO = 0.6   # 60% линий для подтверждения контента
+    SECOND_PASS_SENSITIVITY_MULTIPLIER = 1.5
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -138,6 +167,26 @@ class AutoBorderCrop:
 
     @torch.no_grad()
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
+        """
+        Обрезает однотонные рамки с краёв изображения.
+
+        Args:
+            image: Тензор изображения формата [B, H, W, C] со значениями в [0, 1]
+            sensitivity: Чувствительность детекции рамки (1.0-50.0)
+            min_border_size: Минимальный размер рамки для обрезки в пикселях
+
+        Returns:
+            Tuple[torch.Tensor]: Обрезанное изображение формата [B, H', W', C]
+        """
+        # Валидация входных данных
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor, got {type(image)}")
+        if len(image.shape) != 4:
+            raise ValueError(f"Expected image shape [B, H, W, C], got {image.shape}")
+        if image.shape[1] < 10 or image.shape[2] < 10:
+            logger.warning(f"Image too small: {image.shape}, returning original")
+            return (image,)
+
         device = get_device()
         batch_size = image.shape[0]
         results = []
@@ -234,13 +283,6 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w - 1 - i, :3]
             max_pos = w
 
-        # Пороги
-        EDGE_DYNAMICS_THRESHOLD = 50.0  # std для контента
-        AMBIGUOUS_THRESHOLD_LOW = 15.0   # ниже — чистый фон
-        AMBIGUOUS_THRESHOLD_HIGH = 40.0  # выше — контент
-        MIN_COVERAGE = 0.7
-        LOOKAHEAD_PIXELS = 30  # смотрим вперёд чтобы найти объект за тенью
-
         prev_is_uniform = True
         ambiguous_start = None
         in_ambiguous_zone = False
@@ -251,7 +293,7 @@ class AutoBorderCrop:
 
             # Проверяем яркость — чёрный/белый фон?
             line_mean = line.mean().item()
-            is_bw_background = line_mean < 30 or line_mean > 225
+            is_bw_background = line_mean < self.BLACK_THRESHOLD or line_mean > self.WHITE_THRESHOLD
 
             # Проверяем покрытие динамикой
             num_segments = 10
@@ -264,7 +306,7 @@ class AutoBorderCrop:
                     seg_pixels = line[seg_start:seg_end]
                     if seg_pixels.numel() > 0:
                         seg_std = seg_pixels.std(dim=0).mean().item()
-                        if seg_std > 20:
+                        if seg_std > self.SEGMENT_STD_THRESHOLD:
                             segments_dynamic += 1
             else:
                 segment_size = max(1, h // num_segments)
@@ -275,15 +317,15 @@ class AutoBorderCrop:
                     seg_pixels = line[seg_start:seg_end]
                     if seg_pixels.numel() > 0:
                         seg_std = seg_pixels.std(dim=0).mean().item()
-                        if seg_std > 20:
+                        if seg_std > self.SEGMENT_STD_THRESHOLD:
                             segments_dynamic += 1
 
             coverage = segments_dynamic / num_segments
-            is_content_line = line_std > EDGE_DYNAMICS_THRESHOLD and coverage > MIN_COVERAGE
+            is_content_line = line_std > self.DYNAMIC_STD_THRESHOLD and coverage > self.MIN_COVERAGE
 
             # Неоднозначная зона: не чистый фон, но и не контент (тень, градиент)
-            is_ambiguous = (AMBIGUOUS_THRESHOLD_LOW < line_std < AMBIGUOUS_THRESHOLD_HIGH and
-                           not is_bw_background and coverage < MIN_COVERAGE)
+            is_ambiguous = (self.AMBIGUOUS_STD_LOW < line_std < self.AMBIGUOUS_STD_HIGH and
+                           not is_bw_background and coverage < self.MIN_COVERAGE)
 
             # Запоминаем начало неоднозначной зоны
             if is_ambiguous and ambiguous_start is None and prev_is_uniform:
@@ -296,7 +338,7 @@ class AutoBorderCrop:
                 if in_ambiguous_zone:
                     # За тенью/градиентом есть реальный объект — это часть фото!
                     # Проверяем что объект продолжается дальше (не случайный шум)
-                    content_continues = self._check_content_continues(img, side, pos, LOOKAHEAD_PIXELS)
+                    content_continues = self._check_content_continues(img, side, pos, self.LOOKAHEAD_PIXELS)
                     if content_continues:
                         # Реальный объект за тенью — не режем! LaMa заполнит тень
                         logger.info(f"{side}: content found after shadow at {pos}, keeping object, LaMa will fill shadow")
@@ -310,7 +352,7 @@ class AutoBorderCrop:
                     logger.info(f"{side}: found sharp edge at {pos}, std={line_std:.1f}, coverage={coverage:.1%}")
                     return pos, None
 
-            prev_is_uniform = line_std < AMBIGUOUS_THRESHOLD_LOW
+            prev_is_uniform = line_std < self.AMBIGUOUS_STD_LOW
             if not is_ambiguous:
                 in_ambiguous_zone = False
 
@@ -338,13 +380,13 @@ class AutoBorderCrop:
             if line is None:
                 break
             line_std = line.float().std(dim=0).mean().item()
-            if line_std > 40:  # динамика выше порога
+            if line_std > self.CONTENT_STD_THRESHOLD:
                 content_lines += 1
 
-        # Если больше 60% линий имеют высокую динамику — это реальный объект
+        # Если больше CONTENT_CONTINUE_RATIO линий имеют высокую динамику — это реальный объект
         ratio = content_lines / max(1, lookahead)
         logger.info(f"{side}: content check at {start_pos}, {content_lines}/{lookahead} lines = {ratio:.1%}")
-        return ratio > 0.6
+        return ratio > self.CONTENT_CONTINUE_RATIO
 
     def _is_pure_border_color(self, img: torch.Tensor, side: str, depth: int = 30) -> Tuple[bool, Optional[torch.Tensor]]:
         """Проверяет, является ли край чисто чёрным/белым/серым.
@@ -410,14 +452,17 @@ class AutoBorderCrop:
         has_content = color_content > 0.1 or brightness_content > 0.3
         return has_content
 
-    def _has_high_dynamics_at_border(self, img: torch.Tensor, side: str, border_pos: int) -> bool:
-        """Проверяет, есть ли высокая динамика контента на границе обрезки.
-        Если да — safe space можно игнорировать и резать рамку полностью.
+    def _is_colorful_content_at_border(self, img: torch.Tensor, side: str, border_pos: int) -> bool:
+        """Проверяет, есть ли ЦВЕТНОЙ контент на границе обрезки.
 
-        Высокая динамика = контент с чёткой границей (не плавный переход).
+        Если цветной (не чёрно-белый/серый) — это точно не фон для обрезки,
+        safe space не нужен, режем рамку полностью.
+
+        Цветной = насыщенность > 30 (разница между max и min каналов RGB).
+        Даже равномерное голубое небо — это цветной контент.
         """
         h, w = img.shape[:2]
-        check_depth = 20  # проверяем 20 пикселей от границы обрезки
+        check_depth = self.CHECK_DEPTH
 
         if side == 'left':
             if border_pos >= w:
@@ -441,21 +486,21 @@ class AutoBorderCrop:
         if strip.numel() == 0:
             return False
 
-        # Считаем std по всей полосе
-        strip_std = strip.float().std(dim=(0, 1)).mean().item()
-
         # Проверяем насыщенность (цветной контент)
         pixels = strip.reshape(-1, 3).float()
         saturation = (pixels.max(dim=1).values - pixels.min(dim=1).values)
-        color_ratio = (saturation > 30).float().mean().item()
+        color_ratio = (saturation > self.SATURATION_THRESHOLD).float().mean().item()
 
-        # Высокая динамика = std > 40 ИЛИ много цветных пикселей
-        has_dynamics = strip_std > 40 or color_ratio > 0.3
+        # Также проверяем высокую динамику — это тоже явный контент
+        strip_std = strip.float().std(dim=(0, 1)).mean().item()
 
-        if has_dynamics:
-            logger.info(f"{side}: high dynamics at border {border_pos}, std={strip_std:.1f}, color={color_ratio:.1%} -> ignore safe space")
+        # Цветной контент ИЛИ высокая динамика = не серый фон, safe space не нужен
+        is_colorful = color_ratio > self.COLORFUL_RATIO_THRESHOLD or strip_std > self.HIGH_DYNAMICS_STD
 
-        return has_dynamics
+        if is_colorful:
+            logger.info(f"{side}: colorful/dynamic content at border {border_pos}, color={color_ratio:.1%}, std={strip_std:.1f} -> ignore safe space")
+
+        return is_colorful
 
     def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> torch.Tensor:
         """Обрабатывает одно изображение полностью на GPU."""
@@ -505,7 +550,7 @@ class AutoBorderCrop:
 
                     # НОВОЕ: Проверяем динамику контента на границе обрезки
                     # Если высокая динамика — игнорируем safe space и режем полностью
-                    has_dynamics = self._has_high_dynamics_at_border(img_gpu, side, detected_border)
+                    has_dynamics = self._is_colorful_content_at_border(img_gpu, side, detected_border)
 
                     if has_dynamics:
                         # Высокая динамика — чёткий край контента, режем полностью
@@ -553,8 +598,8 @@ class AutoBorderCrop:
             safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
             # НОВОЕ: Проверяем динамику контента на границах top/bottom
-            top_has_dynamics = self._has_high_dynamics_at_border(img_gpu, 'top', top_border) if top_border > 0 else False
-            bottom_has_dynamics = self._has_high_dynamics_at_border(img_gpu, 'bottom', bottom_border) if bottom_border > 0 else False
+            top_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'top', top_border) if top_border > 0 else False
+            bottom_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'bottom', bottom_border) if bottom_border > 0 else False
 
             if top_border > 0:
                 if top_has_dynamics:
@@ -629,6 +674,10 @@ class AutoBorderCrop:
         new_w = w - crop['left'] - crop['right']
 
         if new_h < h * self.MIN_CONTENT_RATIO or new_w < w * self.MIN_CONTENT_RATIO:
+            logger.warning(
+                f"Crop too aggressive: {new_h}x{new_w} < {h * self.MIN_CONTENT_RATIO:.0f}x{w * self.MIN_CONTENT_RATIO:.0f}, "
+                f"returning original image"
+            )
             return (img_gpu / 255.0).clamp(0, 1).cpu()
 
         y1 = crop['top']
@@ -637,6 +686,7 @@ class AutoBorderCrop:
         x2 = w - crop['right'] if crop['right'] > 0 else w
 
         if y1 >= y2 or x1 >= x2:
+            logger.warning(f"Invalid crop bounds: y1={y1}, y2={y2}, x1={x1}, x2={x2}, returning original")
             return (img_gpu / 255.0).clamp(0, 1).cpu()
 
         result = (img_gpu[y1:y2, x1:x2] / 255.0).clamp(0, 1).cpu()
@@ -657,12 +707,13 @@ class AutoBorderCrop:
         # Возвращаем реальный цвет БЕЗ нормализации к чёрному/белому
         return median
 
-    def _apply_lama_to_borders_gpu(self, img_gpu: torch.Tensor, crop: dict, content_bbox: tuple, top_type: str, bottom_type: str) -> torch.Tensor:
+    def _apply_lama_to_borders_gpu(self, img_gpu: torch.Tensor, crop: Dict[str, int], content_bbox: Tuple[int, int, int, int], top_type: str, bottom_type: str) -> torch.Tensor:
         """Применяет LaMa для mixed областей."""
-        try:
-            from simple_lama_inpainting import SimpleLama
-            from PIL import Image
+        if not HAS_LAMA:
+            logger.warning("LaMa not available, skipping border inpainting")
+            return img_gpu
 
+        try:
             h, w = img_gpu.shape[:2]
             by1, by2, bx1, bx2 = content_bbox
 
@@ -1028,10 +1079,11 @@ class SmartScreenshotCleaner:
 
     def _apply_lama_inpainting(self, img_gpu: torch.Tensor, mask_gpu: torch.Tensor) -> torch.Tensor:
         """Применяет LaMa инпейнтинг для удаления UI элементов."""
-        try:
-            from simple_lama_inpainting import SimpleLama
-            from PIL import Image
+        if not HAS_LAMA:
+            logger.warning("LaMa not available, falling back to color fill")
+            return self._fallback_color_fill(img_gpu, mask_gpu)
 
+        try:
             # Конвертируем в numpy для LaMa
             img_np = img_gpu.cpu().numpy().astype(np.uint8)
             mask_np = (mask_gpu.cpu().numpy() * 255).astype(np.uint8)
@@ -1045,9 +1097,6 @@ class SmartScreenshotCleaner:
             result_np = np.array(result).astype(np.float32) / 255.0
             return torch.from_numpy(result_np)
 
-        except ImportError:
-            logger.warning("simple_lama_inpainting not installed, falling back to color fill")
-            return self._fallback_color_fill(img_gpu, mask_gpu)
         except Exception as e:
             logger.warning(f"LaMa failed: {e}, falling back to color fill")
             return self._fallback_color_fill(img_gpu, mask_gpu)
