@@ -52,7 +52,9 @@ class AutoBorderCrop:
         for side in ['top', 'bottom', 'left', 'right']:
             crop[side] = self._detect_border(img, side, sensitivity, min_border_size)
 
-        # Ограничиваем кроп чтобы не срезать контент (50px запас)
+        logger.info(f"Detected borders: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
+
+        # Ограничиваем кроп чтобы не срезать контент (50px запас от главного объекта)
         if content_bbox:
             cy1, cy2, cx1, cx2 = content_bbox
             max_top = max(0, cy1 - self.SAFE_MARGIN)
@@ -60,12 +62,21 @@ class AutoBorderCrop:
             max_left = max(0, cx1 - self.SAFE_MARGIN)
             max_right = max(0, w - cx2 - self.SAFE_MARGIN)
 
-            crop['top'] = min(crop['top'], max_top)
-            crop['bottom'] = min(crop['bottom'], max_bottom)
-            crop['left'] = min(crop['left'], max_left)
-            crop['right'] = min(crop['right'], max_right)
+            # Применяем ограничение — главный объект приоритет
+            if crop['top'] > max_top:
+                logger.info(f"Top crop limited: {crop['top']} -> {max_top} (content protection)")
+                crop['top'] = max_top
+            if crop['bottom'] > max_bottom:
+                logger.info(f"Bottom crop limited: {crop['bottom']} -> {max_bottom} (content protection)")
+                crop['bottom'] = max_bottom
+            if crop['left'] > max_left:
+                logger.info(f"Left crop limited: {crop['left']} -> {max_left} (content protection)")
+                crop['left'] = max_left
+            if crop['right'] > max_right:
+                logger.info(f"Right crop limited: {crop['right']} -> {max_right} (content protection)")
+                crop['right'] = max_right
 
-        logger.info(f"Crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
+        logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
         # Проверка что осталось достаточно контента
         if (h - crop['top'] - crop['bottom']) < h * 0.3 or (w - crop['left'] - crop['right']) < w * 0.3:
