@@ -123,6 +123,19 @@ class AutoBorderCrop:
         return saturation < saturation_threshold
 
     def _detect_border(self, img, side, sensitivity, min_size):
+        """Двойной проход: сначала полосы, потом углы."""
+        h, w = img.shape[:2]
+
+        # Проход 1: полосы по всей стороне
+        border_pass1 = self._detect_border_by_lines(img, side, sensitivity, min_size)
+
+        # Проход 2: проверка угла после первого прохода
+        border_pass2 = self._detect_border_by_corner(img, side, sensitivity, min_size, border_pass1)
+
+        return max(border_pass1, border_pass2)
+
+    def _detect_border_by_lines(self, img, side, sensitivity, min_size):
+        """Проход 1: детекция по полным линиям."""
         h, w = img.shape[:2]
 
         if side == 'top':
@@ -138,15 +151,14 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w-1-i, :3]
             max_scan = w // 2
 
-        # Берём первые несколько линий для определения цвета рамки
-        sample_lines = min(10, max_scan)
+        # Референсный цвет из первых линий
+        sample_lines = min(5, max_scan)
         sample_pixels = []
         for i in range(sample_lines):
             sample_pixels.append(get_line(i))
         sample = np.vstack(sample_pixels).astype(np.float32)
         ref_color = np.median(sample, axis=0)
 
-        # Проверяем что это оттенок серого (чёрный/белый/серый)
         if not self._is_grayscale_color(ref_color):
             return 0
 
@@ -155,7 +167,6 @@ class AutoBorderCrop:
             line = get_line(i).astype(np.float32)
             line_median = np.median(line, axis=0)
 
-            # Проверяем что линия серая и близка к рамке
             if self._is_grayscale_color(line_median):
                 diff = np.abs(line_median - ref_color).mean()
                 if diff < sensitivity:
@@ -166,6 +177,58 @@ class AutoBorderCrop:
                 break
 
         return border if border >= min_size else 0
+
+    def _detect_border_by_corner(self, img, side, sensitivity, min_size, start_offset):
+        """Проход 2: проверка угла — если там ещё серое, дорезаем."""
+        h, w = img.shape[:2]
+        corner_size = min(100, h // 4, w // 4)
+
+        # Берём угол с учётом уже срезанного
+        if side == 'top':
+            y_start = start_offset
+            corner = img[y_start:y_start+corner_size, 0:corner_size, :3]
+            get_line = lambda i: img[start_offset + i, :, :3]
+            max_scan = h // 2 - start_offset
+        elif side == 'bottom':
+            y_start = h - start_offset - corner_size
+            corner = img[max(0, y_start):h-start_offset, 0:corner_size, :3]
+            get_line = lambda i: img[h-1-start_offset-i, :, :3]
+            max_scan = h // 2 - start_offset
+        elif side == 'left':
+            x_start = start_offset
+            corner = img[0:corner_size, x_start:x_start+corner_size, :3]
+            get_line = lambda i: img[:, start_offset + i, :3]
+            max_scan = w // 2 - start_offset
+        else:
+            x_start = w - start_offset - corner_size
+            corner = img[0:corner_size, max(0, x_start):w-start_offset, :3]
+            get_line = lambda i: img[:, w-1-start_offset-i, :3]
+            max_scan = w // 2 - start_offset
+
+        if corner.size == 0 or max_scan <= 0:
+            return 0
+
+        ref_color = np.median(corner.reshape(-1, 3).astype(np.float32), axis=0)
+
+        if not self._is_grayscale_color(ref_color):
+            return 0
+
+        extra_border = 0
+        for i in range(max_scan):
+            line = get_line(i).astype(np.float32)
+            line_median = np.median(line, axis=0)
+
+            if self._is_grayscale_color(line_median):
+                diff = np.abs(line_median - ref_color).mean()
+                if diff < sensitivity * 1.5:  # Чуть мягче для второго прохода
+                    extra_border = i + 1
+                else:
+                    break
+            else:
+                break
+
+        total = start_offset + extra_border
+        return total if extra_border >= min_size else start_offset
 
 
 class SmartScreenshotCleaner:
