@@ -162,8 +162,8 @@ class AutoBorderCrop:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
+    RETURN_NAMES = ("image", "debug_mask", "debug_bbox")
     FUNCTION = "crop_borders"
     CATEGORY = "image/preprocessing"
 
@@ -178,7 +178,10 @@ class AutoBorderCrop:
             min_border_size: Минимальный размер рамки для обрезки в пикселях
 
         Returns:
-            Tuple[torch.Tensor]: Обрезанное изображение формата [B, H', W', C]
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - Обрезанное изображение [B, H', W', C]
+                - Debug маска краёв [B, H, W]
+                - Debug изображение с bbox [B, H, W, C]
         """
         # Валидация входных данных
         if not isinstance(image, torch.Tensor):
@@ -187,33 +190,18 @@ class AutoBorderCrop:
             raise ValueError(f"Expected image shape [B, H, W, C], got {image.shape}")
         if image.shape[1] < 10 or image.shape[2] < 10:
             logger.warning(f"Image too small: {image.shape}, returning original")
-            return (image,)
+            h, w = image.shape[1], image.shape[2]
+            empty_mask = torch.zeros(image.shape[0], h, w)
+            return (image, empty_mask, image.clone())
 
         device = get_device()
-        batch_size = image.shape[0]
-        results = []
 
-        for batch_idx in range(batch_size):
-            single_image = image[batch_idx]
-            result = self._process_single_image_gpu(single_image, sensitivity, min_border_size, device)
-            results.append(result)
+        # Всегда обрабатываем только первое изображение из батча
+        single_image = image[0]
+        result, debug_mask, debug_bbox = self._process_single_image_gpu(single_image, sensitivity, min_border_size, device)
 
-        if len(results) == 1:
-            return (results[0].unsqueeze(0),)
-
-        max_h = max(r.shape[0] for r in results)
-        max_w = max(r.shape[1] for r in results)
-
-        padded_results = []
-        for r in results:
-            h, w = r.shape[:2]
-            if h < max_h or w < max_w:
-                pad_h = max_h - h
-                pad_w = max_w - w
-                r = F.pad(r.permute(2, 0, 1), (0, pad_w, 0, pad_h), mode='constant', value=0).permute(1, 2, 0)
-            padded_results.append(r)
-
-        return (torch.stack(padded_results),)
+        # Возвращаем с batch dimension
+        return (result.unsqueeze(0), debug_mask.unsqueeze(0), debug_bbox.unsqueeze(0))
 
     def _detect_person_bbox_yolo(self, img_gpu: torch.Tensor, device: torch.device) -> Optional[Tuple[int, int, int, int]]:
         """Детектирует человека через YOLO v11 и возвращает bbox."""
@@ -506,6 +494,78 @@ class AutoBorderCrop:
         saturation = (pixels.max(dim=-1).values - pixels.min(dim=-1).values).float().mean().item()
         return saturation < self.NEUTRAL_SATURATION
 
+    def _classify_edge_type(self, img: torch.Tensor, side: str, depth: int = 50) -> str:
+        """Классифицирует тип края изображения.
+
+        Возвращает один из трёх типов:
+        1. 'dynamic_colorful' — высокая динамика цветов (фото) — НЕ РЕЗАТЬ
+        2. 'uniform_neutral' — равномерный нейтральный (чёрный/серый/белый) — МОЖНО РЕЗАТЬ
+        3. 'uniform_colorful' — равномерный цветной (розовый, голубой и т.д.) — НЕ РЕЗАТЬ
+
+        Логика:
+        - Сначала проверяем динамику (STD) — высокая = фото
+        - Потом проверяем насыщенность — высокая = цветной
+        - Если низкая динамика + низкая насыщенность = нейтральный фон
+        """
+        h, w = img.shape[:2]
+
+        # Получаем полосу края
+        if side == 'left':
+            strip = img[:, 0:depth, :3]
+        elif side == 'right':
+            strip = img[:, w-depth:w, :3]
+        elif side == 'top':
+            strip = img[0:depth, :, :3]
+        else:  # bottom
+            strip = img[h-depth:h, :, :3]
+
+        if strip.numel() == 0:
+            return 'uniform_neutral'
+
+        pixels = strip.reshape(-1, 3).float()
+
+        # 1. Проверяем динамику (вариативность цветов)
+        strip_std = pixels.std(dim=0).mean().item()
+
+        # 2. Проверяем насыщенность (цветность)
+        # Насыщенность = max(R,G,B) - min(R,G,B) для каждого пикселя
+        max_ch = pixels.max(dim=1).values
+        min_ch = pixels.min(dim=1).values
+        saturation_per_pixel = max_ch - min_ch
+        mean_saturation = saturation_per_pixel.mean().item()
+
+        # Процент цветных пикселей (насыщенность > порога)
+        colorful_ratio = (saturation_per_pixel > self.SATURATION_THRESHOLD).float().mean().item()
+
+        # 3. Проверяем яркость (для определения чёрный/белый)
+        mean_brightness = pixels.mean().item()
+
+        # Классификация
+        # Высокая динамика = фото с разнообразием цветов
+        if strip_std > self.DYNAMIC_STD_THRESHOLD:
+            logger.info(f"{side}: DYNAMIC_COLORFUL (std={strip_std:.1f} > {self.DYNAMIC_STD_THRESHOLD})")
+            return 'dynamic_colorful'
+
+        # Низкая динамика — проверяем цветность
+        # Если много цветных пикселей — это равномерный цветной фон (небо, стена)
+        if colorful_ratio > 0.3 or mean_saturation > self.SATURATION_THRESHOLD:
+            logger.info(f"{side}: UNIFORM_COLORFUL (colorful_ratio={colorful_ratio:.1%}, sat={mean_saturation:.1f})")
+            return 'uniform_colorful'
+
+        # Низкая динамика + низкая насыщенность = нейтральный
+        # Дополнительно проверяем что это чёрный/серый/белый
+        is_dark = mean_brightness < 50
+        is_light = mean_brightness > 200
+        is_gray = 50 <= mean_brightness <= 200 and mean_saturation < 20
+
+        if is_dark or is_light or is_gray:
+            logger.info(f"{side}: UNIFORM_NEUTRAL (brightness={mean_brightness:.1f}, sat={mean_saturation:.1f}, std={strip_std:.1f})")
+            return 'uniform_neutral'
+
+        # Неопределённый случай — считаем цветным для безопасности
+        logger.info(f"{side}: UNIFORM_COLORFUL (fallback, brightness={mean_brightness:.1f}, sat={mean_saturation:.1f})")
+        return 'uniform_colorful'
+
     def _find_dynamics_boundary(self, img: torch.Tensor, side: str, content_bbox: Optional[Tuple]) -> Optional[int]:
         """Находит границу между областью с высокой динамикой (фото) и нейтральным фоном.
 
@@ -695,19 +755,29 @@ class AutoBorderCrop:
 
         return is_colorful
 
-    def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> torch.Tensor:
-        """Обрабатывает одно изображение полностью на GPU."""
+    def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Обрабатывает одно изображение полностью на GPU.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - Обрезанное изображение [H', W', C]
+                - Debug маска краёв [H, W] — где 1=область для обрезки
+                - Debug изображение с bbox [H, W, C] — оригинал с нарисованным bbox
+        """
         img_gpu = (image.to(device) * 255.0).float()
         h, w = img_gpu.shape[:2]
         need_lama = False
 
-        # 1. Пробуем детектировать человека через YOLO (быстрее и точнее)
+        # Создаём debug маску (будем отмечать области для обрезки)
+        debug_mask = torch.zeros(h, w, device=device)
+
+        # 1. Пробуем детектировать человека через YOLO
         person_bbox = self._detect_person_bbox_yolo(img_gpu, device)
 
         # 2. Fallback на детекцию контента по цвету
         content_bbox = self._find_content_bbox_gpu(img_gpu)
 
-        # Объединяем bbox'ы — берём максимальный охват
+        # Объединяем bbox'ы
         if person_bbox and content_bbox:
             py1, py2, px1, px2 = person_bbox
             cy1, cy2, cx1, cx2 = content_bbox
@@ -720,163 +790,78 @@ class AutoBorderCrop:
             final_bbox = content_bbox
             logger.info(f"Using content bbox: {final_bbox}")
 
+        # Создаём debug изображение с bbox
+        debug_bbox_img = self._create_debug_bbox_image(img_gpu, final_bbox, person_bbox, content_bbox)
+
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
 
-        # 3. Проверяем края — режем если нейтральный фон (чёрный/серый/белый) рядом с динамичным контентом
-        for side in ['left', 'right']:
-            is_pure, edge_color = self._is_pure_border_color(img_gpu, side)
+        # 3. НОВАЯ ЛОГИКА: Классифицируем каждый край по трём типам
+        edge_types = {}
+        for side in ['left', 'right', 'top', 'bottom']:
+            edge_types[side] = self._classify_edge_type(img_gpu, side)
+
+        logger.info(f"Edge classification: {edge_types}")
+
+        # 4. Обрабатываем каждую сторону по новой логике
+        for side in ['left', 'right', 'top', 'bottom']:
+            edge_type = edge_types[side]
+
+            # Тип 1: dynamic_colorful — фото с высокой динамикой — НЕ РЕЗАТЬ
+            if edge_type == 'dynamic_colorful':
+                logger.info(f"{side}: DYNAMIC_COLORFUL — NOT cropping (photo content)")
+                crop[side] = 0
+                continue
+
+            # Тип 3: uniform_colorful — равномерный цветной (розовое небо) — НЕ РЕЗАТЬ
+            if edge_type == 'uniform_colorful':
+                logger.info(f"{side}: UNIFORM_COLORFUL — NOT cropping (colored background like sky)")
+                crop[side] = 0
+                continue
+
+            # Тип 2: uniform_neutral — чёрный/серый/белый фон — МОЖНО РЕЗАТЬ
+            # Но проверяем что это действительно рамка, а не часть фото
             detected_border = self._detect_border_gpu(img_gpu, side, sensitivity, min_border_size)
 
-            # ГЛАВНОЕ: Ищем границу динамики — где заканчивается нейтральный фон и начинается контент
-            dynamics_boundary = self._find_dynamics_boundary(img_gpu, side, final_bbox)
-
-            if dynamics_boundary is not None and dynamics_boundary > 0:
-                # Нашли чёткую границу между нейтральным фоном и цветным контентом
-                crop[side] = dynamics_boundary
-                logger.info(f"{side}: dynamics boundary found, crop={dynamics_boundary}")
-            elif is_pure and detected_border > 0:
-                # Дополнительная проверка — есть ли контент на границе обрезки
-                has_content = self._check_content_at_edge(img_gpu, side, detected_border)
-
-                if has_content:
-                    logger.info(f"{side}: has content at border {detected_border}, not cropping")
-                    crop[side] = 0
-                elif final_bbox:
-                    _, _, bx1, bx2 = final_bbox
-                    if side == 'left':
-                        safe_limit = max(0, bx1 - self.SAFE_MARGIN_HORIZONTAL)
-                    else:
-                        safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
-
-                    # НОВОЕ: Проверяем динамику контента на границе обрезки
-                    # Если высокая динамика — игнорируем safe space и режем полностью
-                    has_dynamics = self._is_colorful_content_at_border(img_gpu, side, detected_border)
-
-                    if has_dynamics:
-                        # Высокая динамика — чёткий край контента, режем полностью
-                        crop[side] = detected_border
-                        logger.info(f"{side}: high dynamics, ignoring safe space, crop={detected_border}")
-                    elif detected_border > safe_limit:
-                        # Обрезка хочет зайти в safe space — ищем чёткую границу контента
-                        sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, side, safe_limit, detected_border)
-                        if sharp_edge is not None:
-                            # Нашли чёткую границу — режем до неё
-                            crop[side] = sharp_edge
-                            logger.info(f"{side}: found sharp edge at {sharp_edge}, cropping to it (was {detected_border})")
-                        elif ambiguous_start is not None:
-                            # Есть неоднозначная зона — режем до неё и помечаем для LaMa
-                            crop[side] = ambiguous_start
-                            need_lama = True
-                            logger.info(f"{side}: ambiguous zone at {ambiguous_start}, crop there + LaMa")
-                        else:
-                            # Нет чёткой границы — останавливаемся на safe limit
-                            crop[side] = safe_limit
-                            logger.info(f"{side}: no sharp edge in safe zone, crop={safe_limit} (wanted {detected_border})")
-                    else:
-                        # Обрезка не заходит в safe space — просто режем
-                        crop[side] = detected_border
-                        logger.info(f"{side}: pure border, crop={crop[side]} (within safe limit)")
-                else:
-                    crop[side] = detected_border
-            else:
-                logger.info(f"{side}: not pure border or no border detected")
+            if detected_border <= 0:
+                logger.info(f"{side}: UNIFORM_NEUTRAL but no border detected")
                 crop[side] = 0
+                continue
 
-        # 4. Анализируем верх/низ
-        top_type = self._analyze_edge_strip_gpu(img_gpu, 'top')
-        bottom_type = self._analyze_edge_strip_gpu(img_gpu, 'bottom')
+            # Проверяем safe space если есть bbox объекта
+            if final_bbox:
+                by1, by2, bx1, bx2 = final_bbox
 
-        logger.info(f"Edge types: top={top_type}, bottom={bottom_type}")
-        logger.info(f"Detected borders: left={crop['left']}, right={crop['right']}")
+                if side == 'left':
+                    safe_limit = max(0, bx1 - self.SAFE_MARGIN_HORIZONTAL)
+                elif side == 'right':
+                    safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
+                elif side == 'top':
+                    safe_limit = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
+                else:  # bottom
+                    safe_limit = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
-        top_border = self._detect_border_gpu(img_gpu, 'top', sensitivity, min_border_size)
-        bottom_border = self._detect_border_gpu(img_gpu, 'bottom', sensitivity, min_border_size)
+                # Ограничиваем обрезку safe limit'ом
+                final_crop = min(detected_border, safe_limit) if safe_limit > 0 else detected_border
+                crop[side] = final_crop
+                logger.info(f"{side}: UNIFORM_NEUTRAL, detected={detected_border}, safe_limit={safe_limit}, crop={final_crop}")
+            else:
+                crop[side] = detected_border
+                logger.info(f"{side}: UNIFORM_NEUTRAL, no bbox, crop={detected_border}")
 
-        # Сначала проверяем границу динамики для top/bottom
-        top_dynamics = self._find_dynamics_boundary(img_gpu, 'top', final_bbox)
-        bottom_dynamics = self._find_dynamics_boundary(img_gpu, 'bottom', final_bbox)
-
-        if top_dynamics is not None and top_dynamics > 0:
-            crop['top'] = top_dynamics
-            logger.info(f"Top: dynamics boundary found, crop={top_dynamics}")
-        elif bottom_dynamics is not None and bottom_dynamics > 0:
-            crop['bottom'] = bottom_dynamics
-            logger.info(f"Bottom: dynamics boundary found, crop={bottom_dynamics}")
-
-        if final_bbox:
-            by1, by2, bx1, bx2 = final_bbox
-            safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
-            safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
-
-            # Проверяем динамику контента на границах (если ещё не обработано)
-            top_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'top', top_border) if top_border > 0 else False
-            bottom_has_dynamics = self._is_colorful_content_at_border(img_gpu, 'bottom', bottom_border) if bottom_border > 0 else False
-
-            if crop['top'] == 0 and top_border > 0:
-                if top_has_dynamics:
-                    # Высокая динамика — игнорируем safe space, режем полностью
-                    crop['top'] = top_border
-                    logger.info(f"Top: high dynamics, ignoring safe space, crop={top_border}")
-                elif top_border > safe_top:
-                    # Сначала ищем чёткую границу контента в safe zone
-                    sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'top', safe_top, top_border)
-
-                    if sharp_edge is not None:
-                        crop['top'] = sharp_edge
-                        logger.info(f"Top: found sharp edge at {sharp_edge}, cropping to it")
-                    elif ambiguous_start is not None:
-                        crop['top'] = ambiguous_start
-                        need_lama = True
-                        logger.info(f"Top: ambiguous zone at {ambiguous_start}, crop there + LaMa")
-                    elif top_type == 'uniform':
-                        fill_color = self._get_border_color_gpu(img_gpu, 'top')
-                        img_gpu[safe_top:top_border, :, :3] = fill_color
-                        crop['top'] = top_border
-                        logger.info(f"Top: uniform, filled {safe_top}-{top_border}, crop={top_border}")
-                    elif top_type == 'dynamic':
-                        crop['top'] = top_border
-                        logger.info(f"Top: dynamic edge, full crop={top_border}")
-                    else:
-                        need_lama = True
-                        crop['top'] = safe_top
-                        logger.info(f"Top: mixed, no sharp edge, crop to safe={safe_top}, LaMa needed")
-                else:
-                    crop['top'] = top_border
-
-            if crop['bottom'] == 0 and bottom_border > 0:
-                if bottom_has_dynamics:
-                    # Высокая динамика — игнорируем safe space, режем полностью
-                    crop['bottom'] = bottom_border
-                    logger.info(f"Bottom: high dynamics, ignoring safe space, crop={bottom_border}")
-                elif bottom_border > safe_bottom:
-                    sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'bottom', safe_bottom, bottom_border)
-
-                    if sharp_edge is not None:
-                        crop['bottom'] = sharp_edge
-                        logger.info(f"Bottom: found sharp edge at {sharp_edge}, cropping to it")
-                    elif ambiguous_start is not None:
-                        crop['bottom'] = ambiguous_start
-                        need_lama = True
-                        logger.info(f"Bottom: ambiguous zone at {ambiguous_start}, crop there + LaMa")
-                    elif bottom_type == 'uniform':
-                        fill_color = self._get_border_color_gpu(img_gpu, 'bottom')
-                        img_gpu[h-bottom_border:h-safe_bottom, :, :3] = fill_color
-                        crop['bottom'] = bottom_border
-                        logger.info(f"Bottom: uniform, filled, crop={bottom_border}")
-                    elif bottom_type == 'dynamic':
-                        crop['bottom'] = bottom_border
-                        logger.info(f"Bottom: dynamic edge, full crop={bottom_border}")
-                    else:
-                        need_lama = True
-                        crop['bottom'] = safe_bottom
-                        logger.info(f"Bottom: mixed, crop to safe={safe_bottom}, LaMa needed")
-                else:
-                    crop['bottom'] = bottom_border
-        else:
-            crop['top'] = top_border
-            crop['bottom'] = bottom_border
+            # Отмечаем в debug маске
+            if crop[side] > 0:
+                if side == 'left':
+                    debug_mask[:, :crop[side]] = 1.0
+                elif side == 'right':
+                    debug_mask[:, w-crop[side]:] = 1.0
+                elif side == 'top':
+                    debug_mask[:crop[side], :] = 1.0
+                else:  # bottom
+                    debug_mask[h-crop[side]:, :] = 1.0
 
         if need_lama and final_bbox:
+            top_type = self._analyze_edge_strip_gpu(img_gpu, 'top')
+            bottom_type = self._analyze_edge_strip_gpu(img_gpu, 'bottom')
             img_gpu = self._apply_lama_to_borders_gpu(img_gpu, crop, final_bbox, top_type, bottom_type)
 
         logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
@@ -889,7 +874,7 @@ class AutoBorderCrop:
                 f"Crop too aggressive: {new_h}x{new_w} < {h * self.MIN_CONTENT_RATIO:.0f}x{w * self.MIN_CONTENT_RATIO:.0f}, "
                 f"returning original image"
             )
-            return (img_gpu / 255.0).clamp(0, 1).cpu()
+            return ((img_gpu / 255.0).clamp(0, 1).cpu(), debug_mask.cpu(), debug_bbox_img.cpu())
 
         y1 = crop['top']
         y2 = h - crop['bottom'] if crop['bottom'] > 0 else h
@@ -898,10 +883,60 @@ class AutoBorderCrop:
 
         if y1 >= y2 or x1 >= x2:
             logger.warning(f"Invalid crop bounds: y1={y1}, y2={y2}, x1={x1}, x2={x2}, returning original")
-            return (img_gpu / 255.0).clamp(0, 1).cpu()
+            return ((img_gpu / 255.0).clamp(0, 1).cpu(), debug_mask.cpu(), debug_bbox_img.cpu())
 
         result = (img_gpu[y1:y2, x1:x2] / 255.0).clamp(0, 1).cpu()
-        return result
+        return (result, debug_mask.cpu(), debug_bbox_img.cpu())
+
+    def _create_debug_bbox_image(self, img_gpu: torch.Tensor, final_bbox: Optional[Tuple],
+                                  person_bbox: Optional[Tuple], content_bbox: Optional[Tuple]) -> torch.Tensor:
+        """Создаёт debug изображение с нарисованными bbox'ами.
+
+        Цвета:
+        - Зелёный: final_bbox (итоговый)
+        - Синий: person_bbox (YOLO)
+        - Жёлтый: content_bbox (по цвету)
+        """
+        debug_img = img_gpu.clone()
+        h, w = debug_img.shape[:2]
+        line_width = max(2, min(h, w) // 200)
+
+        def draw_rect(img, y1, y2, x1, x2, color, width=2):
+            """Рисует прямоугольник на изображении."""
+            y1, y2 = max(0, y1), min(h, y2)
+            x1, x2 = max(0, x1), min(w, x2)
+
+            # Верхняя линия
+            img[y1:y1+width, x1:x2, :3] = color
+            # Нижняя линия
+            img[y2-width:y2, x1:x2, :3] = color
+            # Левая линия
+            img[y1:y2, x1:x1+width, :3] = color
+            # Правая линия
+            img[y1:y2, x2-width:x2, :3] = color
+
+        # Рисуем content_bbox (жёлтый)
+        if content_bbox:
+            cy1, cy2, cx1, cx2 = content_bbox
+            draw_rect(debug_img, cy1, cy2, cx1, cx2,
+                     torch.tensor([255, 255, 0], device=img_gpu.device, dtype=img_gpu.dtype),
+                     line_width)
+
+        # Рисуем person_bbox (синий)
+        if person_bbox:
+            py1, py2, px1, px2 = person_bbox
+            draw_rect(debug_img, py1, py2, px1, px2,
+                     torch.tensor([0, 100, 255], device=img_gpu.device, dtype=img_gpu.dtype),
+                     line_width)
+
+        # Рисуем final_bbox (зелёный) — поверх остальных
+        if final_bbox:
+            fy1, fy2, fx1, fx2 = final_bbox
+            draw_rect(debug_img, fy1, fy2, fx1, fx2,
+                     torch.tensor([0, 255, 0], device=img_gpu.device, dtype=img_gpu.dtype),
+                     line_width + 1)
+
+        return (debug_img / 255.0).clamp(0, 1)
 
     def _get_border_color_gpu(self, img: torch.Tensor, side: str) -> torch.Tensor:
         """Получает РЕАЛЬНЫЙ цвет рамки для заливки на GPU (без нормализации)."""
