@@ -623,11 +623,11 @@ class SmartScreenshotCleaner:
     SURROUNDING_MARGIN = 10
 
     # Параметры для детекции ярких UI элементов (жёлтые точки, иконки и т.д.)
-    BRIGHT_YELLOW_MIN = (200, 180, 0)    # Минимальный RGB для жёлтого
-    BRIGHT_YELLOW_MAX = (255, 255, 100)  # Максимальный RGB для жёлтого
-    MIN_BLOB_SIZE = 5                     # Минимальный размер элемента в пикселях
-    MAX_BLOB_SIZE = 100                   # Максимальный размер (не UI если больше)
-    BLOB_EXPAND_MARGIN = 3                # Расширение области вокруг найденного блоба
+    BRIGHT_YELLOW_MIN = (180, 160, 0)    # Минимальный RGB для жёлтого (расширено)
+    BRIGHT_YELLOW_MAX = (255, 255, 120)  # Максимальный RGB для жёлтого
+    MIN_BLOB_SIZE = 3                     # Минимальный размер элемента в пикселях
+    MAX_BLOB_SIZE = 150                   # Максимальный размер (не UI если больше)
+    BLOB_EXPAND_MARGIN = 5                # Расширение области вокруг найденного блоба
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -726,28 +726,44 @@ class SmartScreenshotCleaner:
         h, w = img.shape[:2]
         device = img.device
 
-        # Детектируем жёлтые элементы (индикаторы Instagram и т.д.)
         r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
-        # Жёлтый: высокий R, высокий G, низкий B
+        # Жёлтый: высокий R, высокий G, низкий B (индикаторы Instagram)
         yellow_mask = (
             (r > self.BRIGHT_YELLOW_MIN[0]) & (r < self.BRIGHT_YELLOW_MAX[0]) &
             (g > self.BRIGHT_YELLOW_MIN[1]) & (g < self.BRIGHT_YELLOW_MAX[1]) &
             (b > self.BRIGHT_YELLOW_MIN[2]) & (b < self.BRIGHT_YELLOW_MAX[2])
         ).float()
 
-        # Детектируем белые мелкие элементы (иконки)
+        # Белые элементы (иконки, текст)
         white_mask = (
-            (r > 240) & (g > 240) & (b > 240)
+            (r > 235) & (g > 235) & (b > 235)
         ).float()
 
-        # Детектируем ярко-красные элементы (сердечки, уведомления)
+        # Ярко-красные элементы (сердечки, уведомления)
         red_mask = (
-            (r > 200) & (g < 100) & (b < 100)
+            (r > 180) & (g < 80) & (b < 80)
         ).float()
 
-        # Объединяем маски
-        combined_mask = torch.maximum(yellow_mask, torch.maximum(white_mask, red_mask))
+        # Оранжевые элементы (некоторые UI)
+        orange_mask = (
+            (r > 200) & (g > 100) & (g < 180) & (b < 80)
+        ).float()
+
+        # Голубые/синие элементы (верификация, ссылки)
+        blue_mask = (
+            (r < 100) & (g > 150) & (b > 200)
+        ).float()
+
+        # Розовые/пурпурные (Instagram gradient icons)
+        pink_mask = (
+            (r > 180) & (g < 100) & (b > 150)
+        ).float()
+
+        # Объединяем все маски
+        combined_mask = yellow_mask
+        for mask in [white_mask, red_mask, orange_mask, blue_mask, pink_mask]:
+            combined_mask = torch.maximum(combined_mask, mask)
 
         if combined_mask.sum() == 0:
             return torch.zeros(h, w, device=device)
@@ -755,11 +771,50 @@ class SmartScreenshotCleaner:
         # Морфология: расширяем найденные области
         mask_4d = combined_mask.unsqueeze(0).unsqueeze(0)
         # Dilate чтобы объединить близкие пиксели
-        dilated = F.max_pool2d(mask_4d, kernel_size=5, stride=1, padding=2)
+        dilated = F.max_pool2d(mask_4d, kernel_size=7, stride=1, padding=3)
         # Erode чтобы убрать шум
         eroded = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
 
         return eroded.squeeze(0).squeeze(0)
+
+    def _detect_ui_with_yolo_person(self, img_np: np.ndarray, device: torch.device) -> List[Tuple[int, int, int, int]]:
+        """Детектирует НЕ-человеческие объекты через YOLOv11 как потенциальные UI."""
+        try:
+            model = _load_yolo_model("yolo_person", device)
+            if model is None:
+                return []
+
+            h, w = img_np.shape[:2]
+
+            # Детектируем ВСЕ объекты, потом исключим людей
+            results = model.predict(img_np, conf=0.25, verbose=False, device=device, imgsz=640)
+
+            boxes = []
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for i in range(len(result.boxes)):
+                    cls = int(result.boxes.cls[i].item())
+                    # Пропускаем людей (class 0) и большие объекты
+                    if cls == 0:
+                        continue
+
+                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
+                    x1, y1, x2, y2 = box
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+
+                    # Только мелкие объекты — это UI
+                    area = (x2 - x1) * (y2 - y1)
+                    if area < (h * w * 0.05) and x2 > x1 and y2 > y1:
+                        boxes.append((x1, y1, x2, y2))
+
+            logger.info(f"YOLOv11 detected {len(boxes)} non-person small objects")
+            return boxes
+
+        except Exception as e:
+            logger.warning(f"YOLOv11 detection failed: {e}")
+            return []
 
     def _find_connected_components_gpu(self, mask: torch.Tensor, min_size: int, max_size: int) -> List[Tuple[int, int, int, int]]:
         """Находит связные компоненты в маске и возвращает их bbox'ы.
@@ -826,7 +881,7 @@ class SmartScreenshotCleaner:
 
     def _process_single_image(self, img: torch.Tensor, model, confidence: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """Обрабатывает одно изображение на GPU.
-        Комбинирует YOLO детекцию + детекцию ярких элементов."""
+        Комбинирует 3 метода детекции: OmniParser + YOLOv11 + цветовая детекция."""
         device = self.device
         h, w = img.shape[:2]
 
@@ -835,8 +890,9 @@ class SmartScreenshotCleaner:
 
         img_np = img_uint8_gpu.cpu().numpy()
 
-        # 1. YOLO детекция (OmniParser для десктопных UI)
-        boxes: List[Tuple[int, int, int, int]] = []
+        all_boxes: List[Tuple[int, int, int, int]] = []
+
+        # 1. OmniParser YOLO (для десктопных UI элементов)
         if model is not None:
             results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=640)
             for result in results:
@@ -848,11 +904,14 @@ class SmartScreenshotCleaner:
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w, x2), min(h, y2)
                     if x2 > x1 and y2 > y1:
-                        boxes.append((x1, y1, x2, y2))
+                        all_boxes.append((x1, y1, x2, y2))
+            logger.info(f"OmniParser detected: {len(all_boxes)} UI elements")
 
-        logger.info(f"YOLO detected: {len(boxes)} UI elements")
+        # 2. YOLOv11 — детектируем мелкие не-человеческие объекты как UI
+        yolo_boxes = self._detect_ui_with_yolo_person(img_np, device)
+        all_boxes.extend(yolo_boxes)
 
-        # 2. Детекция ярких UI элементов (жёлтые точки, иконки Instagram и т.д.)
+        # 3. Цветовая детекция ярких UI элементов (жёлтые точки, иконки и т.д.)
         bright_mask = self._detect_bright_ui_elements_gpu(img_uint8_gpu.float())
         bright_boxes = self._find_connected_components_gpu(
             bright_mask,
@@ -860,9 +919,7 @@ class SmartScreenshotCleaner:
             max_size=self.MAX_BLOB_SIZE
         )
         logger.info(f"Color detected: {len(bright_boxes)} bright UI elements")
-
-        # Объединяем все боксы
-        all_boxes = boxes + bright_boxes
+        all_boxes.extend(bright_boxes)
 
         if not all_boxes:
             logger.info("No UI elements detected, returning original")
@@ -870,8 +927,8 @@ class SmartScreenshotCleaner:
 
         logger.info(f"Total UI elements: {len(all_boxes)}")
 
+        # Создаём маску для всех UI элементов
         ui_mask = torch.zeros(h, w, device=device, dtype=torch.float32)
-        processed = img_uint8_gpu.clone().float()
         img_area = h * w
 
         for x1, y1, x2, y2 in all_boxes:
@@ -880,13 +937,77 @@ class SmartScreenshotCleaner:
                 logger.info(f"Skipping large box {x1},{y1}-{x2},{y2}: {box_area/img_area*100:.1f}% of image")
                 continue
 
-            ui_mask[y1:y2, x1:x2] = 1.0
+            # Расширяем маску на несколько пикселей для лучшего инпейнтинга
+            expand = 5
+            y1_exp = max(0, y1 - expand)
+            y2_exp = min(h, y2 + expand)
+            x1_exp = max(0, x1 - expand)
+            x2_exp = min(w, x2 + expand)
+            ui_mask[y1_exp:y2_exp, x1_exp:x2_exp] = 1.0
+            logger.info(f"Added UI element to mask: {x1},{y1}-{x2},{y2}")
 
-            # Всегда заливаем цветом окружения
-            color = _get_surrounding_color_gpu(img_uint8_gpu.float(), x1, y1, x2, y2, self.SURROUNDING_MARGIN)
-            processed[y1:y2, x1:x2, :3] = color
-            logger.info(f"Filled UI box {x1},{y1}-{x2},{y2} with color {color.cpu().numpy()}")
+        if ui_mask.sum() == 0:
+            logger.info("No valid UI elements to remove")
+            return img, ui_mask.cpu()
 
-        out_img = (processed / 255.0).clamp(0, 1)
+        # Используем LaMa для инпейнтинга всех UI элементов за один проход
+        out_img = self._apply_lama_inpainting(img_uint8_gpu, ui_mask)
 
         return out_img.cpu(), ui_mask.cpu()
+
+    def _apply_lama_inpainting(self, img_gpu: torch.Tensor, mask_gpu: torch.Tensor) -> torch.Tensor:
+        """Применяет LaMa инпейнтинг для удаления UI элементов."""
+        try:
+            from simple_lama_inpainting import SimpleLama
+            from PIL import Image
+
+            # Конвертируем в numpy для LaMa
+            img_np = img_gpu.cpu().numpy().astype(np.uint8)
+            mask_np = (mask_gpu.cpu().numpy() * 255).astype(np.uint8)
+
+            logger.info(f"Applying LaMa inpainting, mask pixels: {(mask_np > 0).sum()}")
+
+            lama = SimpleLama()
+            result = lama(Image.fromarray(img_np), Image.fromarray(mask_np))
+
+            # Конвертируем обратно в tensor [0, 1]
+            result_np = np.array(result).astype(np.float32) / 255.0
+            return torch.from_numpy(result_np)
+
+        except ImportError:
+            logger.warning("simple_lama_inpainting not installed, falling back to color fill")
+            return self._fallback_color_fill(img_gpu, mask_gpu)
+        except Exception as e:
+            logger.warning(f"LaMa failed: {e}, falling back to color fill")
+            return self._fallback_color_fill(img_gpu, mask_gpu)
+
+    def _fallback_color_fill(self, img_gpu: torch.Tensor, mask_gpu: torch.Tensor) -> torch.Tensor:
+        """Fallback: заливка цветом окружения если LaMa недоступен."""
+        h, w = img_gpu.shape[:2]
+        processed = img_gpu.clone().float()
+
+        # Находим связные компоненты в маске
+        mask_np = (mask_gpu > 0.5).cpu().numpy().astype(np.uint8)
+
+        try:
+            from scipy import ndimage
+            labeled, num_features = ndimage.label(mask_np)
+
+            for i in range(1, num_features + 1):
+                coords = np.where(labeled == i)
+                if len(coords[0]) == 0:
+                    continue
+
+                y1, y2 = coords[0].min(), coords[0].max()
+                x1, x2 = coords[1].min(), coords[1].max()
+
+                color = _get_surrounding_color_gpu(img_gpu.float(), x1, y1, x2, y2, self.SURROUNDING_MARGIN)
+                processed[y1:y2+1, x1:x2+1, :3] = color
+
+        except ImportError:
+            # Если scipy недоступен, просто заливаем всю маску средним цветом
+            mask_3d = mask_gpu.unsqueeze(-1).expand(-1, -1, 3)
+            mean_color = img_gpu[mask_gpu < 0.5].reshape(-1, 3).float().mean(dim=0)
+            processed = torch.where(mask_3d > 0.5, mean_color, processed)
+
+        return (processed / 255.0).clamp(0, 1)
