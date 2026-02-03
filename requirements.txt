@@ -1,17 +1,17 @@
 # Core
-torch
-numpy
-opencv-python
-Pillow
+torch>=2.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+Pillow>=9.0.0
 
-# YOLO UI Detection
-ultralytics
-huggingface_hub
+# YOLO UI Detection (GPU accelerated)
+ultralytics>=8.0.0
+huggingface_hub>=0.16.0
 
-# SOD (Salient Object Detection) - выбери один:
-rembg[gpu]  # Рекомендуется - простой и работает
-# transparent-background  # Альтернатива
-# onnxruntime-gpu  # Для ONNX U2Net
+# SOD - Salient Object Detection (GPU accelerated)
+# For GPU: pip install onnxruntime-gpu
+rembg>=2.0.50
+onnxruntime-gpu>=1.15.0
 
-# LaMa Inpainting (опционально)
-simple-lama-inpainting  # pip install simple-lama-inpainting
+# LaMa Inpainting (GPU accelerated, optional)
+simple-lama-inpainting>=0.1.0
