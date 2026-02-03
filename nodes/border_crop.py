@@ -39,25 +39,22 @@ class AutoBorderCrop:
     CATEGORY = "image/preprocessing"
 
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
-        batch_size = image.shape[0]
-        results = []
+        # Для батча берём только первое изображение для определения кропа
+        # и применяем одинаковый кроп ко всем
+        img = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        h, w = img.shape[:2]
 
-        for b in range(batch_size):
-            img = (image[b].cpu().numpy() * 255).astype(np.uint8)
-            h, w = img.shape[:2]
+        crop = {}
+        for side in ['top', 'bottom', 'left', 'right']:
+            crop[side] = self._detect_border(img, side, sensitivity, min_border_size)
 
-            crop = {}
-            for side in ['top', 'bottom', 'left', 'right']:
-                crop[side] = self._detect_border(img, side, sensitivity, min_border_size)
+        if (h - crop['top'] - crop['bottom']) < h * 0.5 or (w - crop['left'] - crop['right']) < w * 0.5:
+            return (image,)
 
-            if (h - crop['top'] - crop['bottom']) < h * 0.5 or (w - crop['left'] - crop['right']) < w * 0.5:
-                crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
+        y1, y2 = crop['top'], h - crop['bottom'] if crop['bottom'] > 0 else h
+        x1, x2 = crop['left'], w - crop['right'] if crop['right'] > 0 else w
 
-            y1, y2 = crop['top'], h - crop['bottom'] if crop['bottom'] > 0 else h
-            x1, x2 = crop['left'], w - crop['right'] if crop['right'] > 0 else w
-            results.append(image[b:b+1, y1:y2, x1:x2, :])
-
-        return (torch.cat(results, dim=0),)
+        return (image[:, y1:y2, x1:x2, :],)
 
     def _detect_border(self, img, side, sensitivity, min_size):
         h, w = img.shape[:2]
