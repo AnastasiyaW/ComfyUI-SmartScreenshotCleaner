@@ -494,10 +494,10 @@ class SmartScreenshotCleaner:
         processed = img_uint8.copy()
 
         for x1, y1, x2, y2 in boxes:
-            # Пропускаем слишком большие боксы (> 30% картинки) — это не UI элемент
+            # Пропускаем слишком большие боксы (> 10% картинки) — это не UI элемент
             box_area = (x2 - x1) * (y2 - y1)
             img_area = h * w
-            if box_area > img_area * 0.3:
+            if box_area > img_area * 0.1:
                 logger.info(f"Skipping large box {x1},{y1}-{x2},{y2}: {box_area/img_area*100:.1f}% of image")
                 continue
 
