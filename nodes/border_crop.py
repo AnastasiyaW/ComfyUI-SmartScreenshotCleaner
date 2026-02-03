@@ -114,41 +114,30 @@ def _load_yolo_model(model_name: str, device: torch.device):
 
 
 class AutoBorderCrop:
-    """Обрезает однотонные чёрные/белые/серые рамки (UI) с краёв изображения.
+    """Обрезает однотонные чёрные/белые/серые рамки с краёв изображения.
 
-    Логика определения:
-    - ИНТЕРФЕЙС: чёрный/белый/серый (R≈G≈B), низкая динамика → РЕЖЕМ
-    - КАРТИНКА: любой цвет ИЛИ высокая динамика → НЕ РЕЖЕМ
-
-    Использует систему весов для надёжного решения.
+    ПРОСТАЯ логика:
+    1. Сканируем от края к центру по линиям
+    2. Серый/чёрный/белый (R≈G≈B, низкая динамика) = рамка → РЕЖЕМ
+    3. Любой цвет ИЛИ высокая динамика = картинка → СТОП
+    4. Safe margins от человека ТОЛЬКО если вокруг него рамка (не картинка)
     """
 
-    # Safe margins (когда НЕ нашли границу картинки)
-    SAFE_MARGIN_VERTICAL = 50      # Отступ сверху/снизу от человека
-    SAFE_MARGIN_HORIZONTAL = 300   # Отступ слева/справа от человека
+    # Safe margins (ТОЛЬКО когда вокруг человека рамка, не картинка)
+    SAFE_MARGIN_VERTICAL = 50
+    SAFE_MARGIN_HORIZONTAL = 300
 
-    # Параметры сканирования
-    SCAN_STEP = 5                  # Шаг сканирования (px)
-    SCAN_STRIP_WIDTH = 10          # Ширина полосы для анализа (px)
+    # Пороги для определения рамки
+    GRAY_MAX_SATURATION = 25.0    # max(R,G,B) - min(R,G,B) < 25 = серый/ч/б
+    GRAY_MAX_STD = 15.0           # STD < 15 = однотонная область (рамка)
 
-    # Пороги для определения типа области
-    # Интерфейс = серый (низкая насыщенность) + низкая динамика
-    GRAY_SATURATION_THRESHOLD = 15.0    # Насыщенность < 15 = серый/ч/б
-    LOW_STD_THRESHOLD = 25.0            # STD < 25 = однотонная область
+    # Пороги для определения картинки
+    PICTURE_MIN_SATURATION = 30.0  # Насыщенность > 30 = есть цвет
+    PICTURE_MIN_STD = 20.0         # STD > 20 = есть динамика
 
-    # Картинка = цвет ИЛИ высокая динамика
-    COLOR_SATURATION_THRESHOLD = 20.0   # Насыщенность > 20 = есть цвет
-    HIGH_STD_THRESHOLD = 35.0           # STD > 35 = динамичная область
-
-    # Веса для принятия решения (сумма > 0.5 = это картинка)
-    WEIGHT_HAS_COLOR = 0.6              # Есть цветные пиксели
-    WEIGHT_HIGH_DYNAMICS = 0.5          # Высокая динамика
-    WEIGHT_PERSON_INSIDE = 0.4          # Человек внутри области
-    WEIGHT_GRADIENT = 0.3               # Есть градиент (плавный переход)
-
-    # Лимиты
-    MIN_CONTENT_RATIO = 0.3             # Минимум 30% контента после обрезки
-    MIN_BORDER_TO_CUT = 5               # Минимум 5px для обрезки
+    MIN_BORDER_TO_CUT = 3          # Минимум 3px для обрезки
+    MIN_CONTENT_RATIO = 0.3        # Минимум 30% контента после обрезки
+    SCAN_LINE_WIDTH = 5            # Ширина сканируемой линии в пикселях
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -167,21 +156,7 @@ class AutoBorderCrop:
 
     @torch.no_grad()
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
-        """
-        Обрезает однотонные рамки с краёв изображения.
-
-        Args:
-            image: Тензор изображения формата [B, H, W, C] со значениями в [0, 1]
-            sensitivity: Чувствительность детекции рамки (1.0-50.0)
-            min_border_size: Минимальный размер рамки для обрезки в пикселях
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - Обрезанное изображение [B, H', W', C]
-                - Debug маска краёв [B, H, W]
-                - Debug изображение с bbox [B, H, W, C]
-        """
-        # Валидация входных данных
+        """Обрезает однотонные рамки с краёв изображения."""
         if not isinstance(image, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(image)}")
         if len(image.shape) != 4:
@@ -193,12 +168,8 @@ class AutoBorderCrop:
             return (image, empty_mask, image.clone())
 
         device = get_device()
-
-        # Всегда обрабатываем только первое изображение из батча
         single_image = image[0]
         result, debug_mask, debug_bbox = self._process_single_image_gpu(single_image, sensitivity, min_border_size, device)
-
-        # Возвращаем с batch dimension
         return (result.unsqueeze(0), debug_mask.unsqueeze(0), debug_bbox.unsqueeze(0))
 
     def _detect_person_bbox_yolo(self, img_gpu: torch.Tensor, device: torch.device) -> Optional[Tuple[int, int, int, int]]:
@@ -208,16 +179,12 @@ class AutoBorderCrop:
             if model is None:
                 return None
 
-            # Конвертируем для YOLO
             img_np = img_gpu.cpu().numpy().astype(np.uint8)
-
-            # Инференс
-            results = model.predict(img_np, conf=0.3, verbose=False, device=device, imgsz=640, classes=[0])  # class 0 = person
+            results = model.predict(img_np, conf=0.3, verbose=False, device=device, imgsz=640, classes=[0])
 
             if not results or len(results) == 0:
                 return None
 
-            # Находим самый большой bbox человека
             best_box = None
             best_area = 0
 
@@ -240,201 +207,156 @@ class AutoBorderCrop:
             logger.warning(f"YOLO person detection failed: {e}")
             return None
 
-    def _get_edge_strip(self, img: torch.Tensor, side: str, depth: int) -> torch.Tensor:
-        """Получает полосу пикселей от края изображения."""
-        h, w = img.shape[:2]
-        if side == 'left':
-            return img[:, 0:depth, :3]
-        elif side == 'right':
-            return img[:, w-depth:w, :3]
-        elif side == 'top':
-            return img[0:depth, :, :3]
-        else:  # bottom
-            return img[h-depth:h, :, :3]
-
-    def _analyze_strip_gpu(self, strip: torch.Tensor) -> Dict[str, float]:
-        """Быстрый анализ полосы пикселей на GPU.
+    def _analyze_line(self, line_pixels: torch.Tensor) -> Tuple[float, float]:
+        """Анализирует линию пикселей.
 
         Returns:
-            dict с метриками: std, saturation, color_ratio, gradient
+            (saturation, std): насыщенность и динамика
         """
-        if strip.numel() == 0:
-            return {'std': 0, 'saturation': 0, 'color_ratio': 0, 'gradient': 0}
+        if line_pixels.numel() == 0:
+            return 0.0, 0.0
 
-        pixels = strip.reshape(-1, 3).float()
+        pixels = line_pixels.reshape(-1, 3).float()
 
-        # STD — динамика пикселей (быстро на GPU)
-        std = pixels.std(dim=0).mean().item()
-
-        # Насыщенность по каждому пикселю: max(R,G,B) - min(R,G,B)
+        # Насыщенность: max(R,G,B) - min(R,G,B) для каждого пикселя
         sat_per_pixel = pixels.max(dim=1).values - pixels.min(dim=1).values
-
-        # Средняя насыщенность
         saturation = sat_per_pixel.mean().item()
 
-        # Доля цветных пикселей (насыщенность > порога)
-        color_ratio = (sat_per_pixel > self.COLOR_SATURATION_THRESHOLD).float().mean().item()
+        # Динамика (STD) — разброс значений
+        std = pixels.std().item()
 
-        # Градиент — разница между началом и концом полосы
-        if len(pixels) > 20:
-            start_mean = pixels[:10].mean(dim=0)
-            end_mean = pixels[-10:].mean(dim=0)
-            gradient = (end_mean - start_mean).abs().mean().item()
-        else:
-            gradient = 0
+        return saturation, std
 
-        return {
-            'std': std,
-            'saturation': saturation,
-            'color_ratio': color_ratio,
-            'gradient': gradient
-        }
+    def _is_border_line(self, saturation: float, std: float) -> bool:
+        """Проверяет, является ли линия частью рамки (серый/ч/б, однотонная)."""
+        is_gray = saturation < self.GRAY_MAX_SATURATION
+        is_uniform = std < self.GRAY_MAX_STD
+        return is_gray and is_uniform
 
-    def _is_picture_area(self, metrics: Dict[str, float], person_inside: bool = False) -> Tuple[bool, float]:
-        """Определяет, является ли область картинкой по системе весов.
+    def _is_picture_line(self, saturation: float, std: float) -> bool:
+        """Проверяет, является ли линия частью картинки (цвет или динамика)."""
+        has_color = saturation >= self.PICTURE_MIN_SATURATION
+        has_dynamics = std >= self.PICTURE_MIN_STD
+        return has_color or has_dynamics
 
-        Returns:
-            (is_picture, confidence): является ли картинкой и уверенность
-        """
-        score = 0.0
-
-        # Есть цветные пиксели — сильный признак картинки
-        if metrics['color_ratio'] > 0.1:  # >10% цветных пикселей
-            score += self.WEIGHT_HAS_COLOR
-        elif metrics['saturation'] > self.COLOR_SATURATION_THRESHOLD:
-            score += self.WEIGHT_HAS_COLOR * 0.7
-
-        # Высокая динамика — признак фото
-        if metrics['std'] > self.HIGH_STD_THRESHOLD:
-            score += self.WEIGHT_HIGH_DYNAMICS
-
-        # Человек внутри области
-        if person_inside:
-            score += self.WEIGHT_PERSON_INSIDE
-
-        # Есть градиент (плавный переход яркости)
-        if metrics['gradient'] > 10:
-            score += self.WEIGHT_GRADIENT
-
-        is_picture = score >= 0.5
-        return is_picture, score
-
-    def _is_interface_area(self, metrics: Dict[str, float]) -> bool:
-        """Проверяет, является ли область интерфейсом (серый/ч/б, низкая динамика)."""
-        is_gray = metrics['saturation'] < self.GRAY_SATURATION_THRESHOLD
-        is_low_dynamics = metrics['std'] < self.LOW_STD_THRESHOLD
-        no_color = metrics['color_ratio'] < 0.05  # <5% цветных пикселей
-
-        return is_gray and is_low_dynamics and no_color
-
-    def _find_picture_boundary(self, img: torch.Tensor, side: str, person_bbox: Optional[Tuple]) -> Tuple[int, bool]:
-        """Находит границу между интерфейсом и картинкой.
-
-        Сканирует от края к центру. Останавливается когда находит картинку.
+    def _scan_from_edge(self, img: torch.Tensor, side: str) -> Tuple[int, bool]:
+        """Сканирует от края к центру, ищет границу рамки.
 
         Returns:
             (border_size, found_picture):
-            - border_size: сколько пикселей интерфейса можно обрезать
-            - found_picture: нашли ли явную границу картинки
+            - border_size: сколько пикселей рамки можно обрезать
+            - found_picture: нашли ли явную границу картинки (цвет/динамика)
         """
         h, w = img.shape[:2]
-        step = self.SCAN_STEP
-        strip_w = self.SCAN_STRIP_WIDTH
+        line_w = self.SCAN_LINE_WIDTH
 
-        # Настройка направления сканирования
         if side == 'top':
             max_scan = h // 2
-            get_strip = lambda pos: img[pos:pos+strip_w, :, :3]
-            person_edge = person_bbox[0] if person_bbox else h  # y1
+            get_line = lambda pos: img[pos:pos+line_w, :, :3]
         elif side == 'bottom':
             max_scan = h // 2
-            get_strip = lambda pos: img[h-pos-strip_w:h-pos, :, :3]
-            person_edge = (h - person_bbox[1]) if person_bbox else h  # h - y2
+            get_line = lambda pos: img[h-pos-line_w:h-pos, :, :3]
         elif side == 'left':
             max_scan = w // 2
-            get_strip = lambda pos: img[:, pos:pos+strip_w, :3]
-            person_edge = person_bbox[2] if person_bbox else w  # x1
+            get_line = lambda pos: img[:, pos:pos+line_w, :3]
         else:  # right
             max_scan = w // 2
-            get_strip = lambda pos: img[:, w-pos-strip_w:w-pos, :3]
-            person_edge = (w - person_bbox[3]) if person_bbox else w  # w - x2
+            get_line = lambda pos: img[:, w-pos-line_w:w-pos, :3]
 
         border_size = 0
         found_picture = False
 
-        for pos in range(0, max_scan, step):
-            strip = get_strip(pos)
-            if strip.numel() == 0:
+        # Сканируем по 1 пикселю для точности
+        for pos in range(0, max_scan):
+            line = get_line(pos)
+            if line.numel() == 0:
                 break
 
-            metrics = self._analyze_strip_gpu(strip)
+            saturation, std = self._analyze_line(line)
 
-            # Проверяем, внутри ли человек этой позиции
-            person_inside = person_bbox is not None and pos >= person_edge - 50
-
-            # Это картинка?
-            is_picture, confidence = self._is_picture_area(metrics, person_inside)
-
-            if is_picture:
-                logger.info(f"{side}: PICTURE at {pos}px (conf={confidence:.2f}, std={metrics['std']:.1f}, sat={metrics['saturation']:.1f}, color={metrics['color_ratio']:.1%})")
-                border_size = pos
+            # Это картинка? (цвет или динамика)
+            if self._is_picture_line(saturation, std):
+                logger.info(f"{side}: PICTURE at {pos}px (sat={saturation:.1f}, std={std:.1f})")
                 found_picture = True
                 break
 
-            # Это точно интерфейс? Продолжаем сканировать
-            if self._is_interface_area(metrics):
-                border_size = pos + step
+            # Это рамка? (серый и однотонный)
+            if self._is_border_line(saturation, std):
+                border_size = pos + 1
             else:
-                # Неопределённая зона — осторожно, стоп
-                logger.info(f"{side}: uncertain at {pos}px (std={metrics['std']:.1f}, sat={metrics['saturation']:.1f})")
-                border_size = pos
+                # Неопределённая зона — стоп
+                logger.info(f"{side}: uncertain at {pos}px (sat={saturation:.1f}, std={std:.1f})")
                 break
 
         return (border_size if border_size >= self.MIN_BORDER_TO_CUT else 0, found_picture)
 
+    def _check_area_around_person(self, img: torch.Tensor, person_bbox: Tuple, side: str) -> bool:
+        """Проверяет, есть ли рамка (не картинка) вокруг человека с данной стороны.
+
+        Returns:
+            True если вокруг человека рамка (можно применить safe margin)
+            False если вокруг человека картинка (нельзя резать)
+        """
+        h, w = img.shape[:2]
+        py1, py2, px1, px2 = person_bbox
+        check_depth = 30  # Проверяем 30px вокруг bbox человека
+
+        if side == 'top':
+            if py1 < check_depth:
+                return False  # Человек слишком близко к краю
+            area = img[max(0, py1-check_depth):py1, px1:px2, :3]
+        elif side == 'bottom':
+            if py2 > h - check_depth:
+                return False
+            area = img[py2:min(h, py2+check_depth), px1:px2, :3]
+        elif side == 'left':
+            if px1 < check_depth:
+                return False
+            area = img[py1:py2, max(0, px1-check_depth):px1, :3]
+        else:  # right
+            if px2 > w - check_depth:
+                return False
+            area = img[py1:py2, px2:min(w, px2+check_depth), :3]
+
+        if area.numel() == 0:
+            return False
+
+        saturation, std = self._analyze_line(area)
+
+        # Если вокруг человека картинка — нельзя применять safe margin
+        if self._is_picture_line(saturation, std):
+            logger.info(f"{side}: PICTURE around person (sat={saturation:.1f}, std={std:.1f}) — no safe margin")
+            return False
+
+        # Если вокруг человека рамка — можно применить safe margin
+        if self._is_border_line(saturation, std):
+            logger.info(f"{side}: BORDER around person (sat={saturation:.1f}, std={std:.1f}) — apply safe margin")
+            return True
+
+        # Неопределённо — лучше не резать
+        return False
+
     def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Обрабатывает одно изображение.
 
-        Алгоритм:
+        ПРОСТОЙ алгоритм:
         1. Детектируем человека через YOLO
-        2. Для каждой стороны сканируем от края, ищем границу картинки
-        3. Если нашли картинку (цвет/динамика) — режем до неё
-        4. Если НЕ нашли — используем safe space от человека
-
-        Returns:
-            Tuple[cropped_image, debug_mask, debug_bbox_image]
+        2. Для каждой стороны сканируем от края
+        3. Серый/однотонный → режем, цвет/динамика → стоп
+        4. Safe margins от человека ТОЛЬКО если вокруг него рамка
         """
         img_gpu = (image.to(device) * 255.0).float()
         h, w = img_gpu.shape[:2]
 
-        # Debug маска
         debug_mask = torch.zeros(h, w, device=device)
-
-        # 1. Детектируем человека через YOLO
         person_bbox = self._detect_person_bbox_yolo(img_gpu, device)
-
-        # Debug изображение
-        debug_bbox_img = self._create_debug_bbox_image(img_gpu, person_bbox, person_bbox, None)
+        debug_bbox_img = self._create_debug_bbox_image(img_gpu, person_bbox)
 
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
 
-        # 2. Для каждой стороны: ищем границу картинки
         for side in ['top', 'bottom', 'left', 'right']:
-            # Сначала проверяем край — если уже картинка, не режем
-            edge_strip = self._get_edge_strip(img_gpu, side, self.SCAN_STRIP_WIDTH)
-            edge_metrics = self._analyze_strip_gpu(edge_strip)
-
-            is_edge_picture, edge_conf = self._is_picture_area(edge_metrics)
-            if is_edge_picture:
-                logger.info(f"{side}: edge is PICTURE (conf={edge_conf:.2f}) — skip")
-                continue
-
-            if not self._is_interface_area(edge_metrics):
-                logger.info(f"{side}: edge uncertain (std={edge_metrics['std']:.1f}, sat={edge_metrics['saturation']:.1f}) — skip")
-                continue
-
-            # Край — интерфейс, ищем где начинается картинка
-            border, found_picture = self._find_picture_boundary(img_gpu, side, person_bbox)
+            # Сканируем от края
+            border, found_picture = self._scan_from_edge(img_gpu, side)
 
             if border < self.MIN_BORDER_TO_CUT:
                 continue
@@ -445,23 +367,29 @@ class AutoBorderCrop:
                 final_border = border
                 logger.info(f"{side}: cut to PICTURE boundary: {final_border}px")
             elif person_bbox:
-                # НЕ нашли картинку, но есть человек — safe space
-                py1, py2, px1, px2 = person_bbox
-                if side == 'top':
-                    safe_limit = max(0, py1 - self.SAFE_MARGIN_VERTICAL)
-                elif side == 'bottom':
-                    safe_limit = max(0, h - py2 - self.SAFE_MARGIN_VERTICAL)
-                elif side == 'left':
-                    safe_limit = max(0, px1 - self.SAFE_MARGIN_HORIZONTAL)
-                else:  # right
-                    safe_limit = max(0, w - px2 - self.SAFE_MARGIN_HORIZONTAL)
+                # НЕ нашли картинку — проверяем, есть ли рамка вокруг человека
+                if self._check_area_around_person(img_gpu, person_bbox, side):
+                    # Вокруг человека рамка — применяем safe margin
+                    py1, py2, px1, px2 = person_bbox
+                    if side == 'top':
+                        safe_limit = max(0, py1 - self.SAFE_MARGIN_VERTICAL)
+                    elif side == 'bottom':
+                        safe_limit = max(0, h - py2 - self.SAFE_MARGIN_VERTICAL)
+                    elif side == 'left':
+                        safe_limit = max(0, px1 - self.SAFE_MARGIN_HORIZONTAL)
+                    else:  # right
+                        safe_limit = max(0, w - px2 - self.SAFE_MARGIN_HORIZONTAL)
 
-                final_border = min(border, safe_limit) if safe_limit > 0 else 0
-                logger.info(f"{side}: NO picture, safe space: border={border}, limit={safe_limit}, final={final_border}")
+                    final_border = min(border, safe_limit) if safe_limit > 0 else 0
+                    logger.info(f"{side}: safe margin applied: border={border}, limit={safe_limit}, final={final_border}")
+                else:
+                    # Вокруг человека картинка или неясно — режем до найденной границы
+                    final_border = border
+                    logger.info(f"{side}: no safe margin (picture around person): {final_border}px")
             else:
-                # Нет ни картинки, ни человека — режем осторожно
+                # Нет человека — режем всю найденную рамку
                 final_border = border
-                logger.info(f"{side}: interface only, cut: {final_border}px")
+                logger.info(f"{side}: cut border: {final_border}px")
 
             crop[side] = final_border
 
@@ -478,7 +406,7 @@ class AutoBorderCrop:
 
         logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
-        # 3. Применяем обрезку
+        # Применяем обрезку
         new_h = h - crop['top'] - crop['bottom']
         new_w = w - crop['left'] - crop['right']
 
@@ -498,8 +426,7 @@ class AutoBorderCrop:
         result = (img_gpu[y1:y2, x1:x2] / 255.0).clamp(0, 1).cpu()
         return (result, debug_mask.cpu(), debug_bbox_img.cpu())
 
-    def _create_debug_bbox_image(self, img_gpu: torch.Tensor, final_bbox: Optional[Tuple],
-                                  person_bbox: Optional[Tuple], content_bbox: Optional[Tuple]) -> torch.Tensor:
+    def _create_debug_bbox_image(self, img_gpu: torch.Tensor, person_bbox: Optional[Tuple]) -> torch.Tensor:
         """Создаёт debug изображение с bbox."""
         debug_img = img_gpu.clone()
         h, w = debug_img.shape[:2]
