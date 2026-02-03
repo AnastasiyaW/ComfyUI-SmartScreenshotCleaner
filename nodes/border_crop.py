@@ -417,6 +417,84 @@ class AutoBorderCrop:
 
         return is_pure, median
 
+    def _is_ui_panel(self, img: torch.Tensor, side: str, depth: int = 100) -> Tuple[bool, int]:
+        """Детектирует UI панель (Instagram, браузер и т.д.) по контрасту с контентом.
+
+        UI панель характеризуется:
+        1. Низкая насыщенность (серый/тёмный фон)
+        2. Резкая вертикальная граница с цветным контентом
+        3. Относительно однородный фон (даже если есть текст)
+
+        Возвращает (is_panel, panel_width).
+        """
+        h, w = img.shape[:2]
+
+        if side == 'right':
+            # Сканируем справа налево, ищем границу контента
+            for x in range(w - 10, max(w // 2, w - depth * 5), -10):
+                # Полоса слева от текущей позиции (контент)
+                left_strip = img[:, max(0, x - 50):x, :3]
+                # Полоса справа от текущей позиции (потенциальная панель)
+                right_strip = img[:, x:min(w, x + 50), :3]
+
+                if left_strip.numel() == 0 or right_strip.numel() == 0:
+                    continue
+
+                # Характеристики левой части (контент)
+                left_pixels = left_strip.reshape(-1, 3).float()
+                left_sat = (left_pixels.max(dim=1).values - left_pixels.min(dim=1).values).mean().item()
+                left_std = left_strip.float().std().item()
+
+                # Характеристики правой части (панель)
+                right_pixels = right_strip.reshape(-1, 3).float()
+                right_sat = (right_pixels.max(dim=1).values - right_pixels.min(dim=1).values).mean().item()
+                right_std = right_strip.float().std().item()
+                right_brightness = right_pixels.mean().item()
+
+                # UI панель: справа низкая насыщенность, слева высокая
+                # И справа относительно однородный тёмный/светлый фон
+                is_panel = (
+                    left_sat > 40 and right_sat < 30 and  # Контраст по насыщенности
+                    left_std > 30 and  # Слева есть динамика
+                    right_brightness < 80 or right_brightness > 200  # Тёмная или светлая панель
+                )
+
+                if is_panel:
+                    panel_width = w - x
+                    logger.info(f"UI panel detected on right: width={panel_width}, "
+                               f"left_sat={left_sat:.1f}, right_sat={right_sat:.1f}")
+                    return True, panel_width
+
+        elif side == 'left':
+            # Аналогично для левой стороны
+            for x in range(10, min(w // 2, depth * 5), 10):
+                right_strip = img[:, x:min(w, x + 50), :3]
+                left_strip = img[:, max(0, x - 50):x, :3]
+
+                if left_strip.numel() == 0 or right_strip.numel() == 0:
+                    continue
+
+                left_pixels = left_strip.reshape(-1, 3).float()
+                left_sat = (left_pixels.max(dim=1).values - left_pixels.min(dim=1).values).mean().item()
+                left_brightness = left_pixels.mean().item()
+
+                right_pixels = right_strip.reshape(-1, 3).float()
+                right_sat = (right_pixels.max(dim=1).values - right_pixels.min(dim=1).values).mean().item()
+                right_std = right_strip.float().std().item()
+
+                is_panel = (
+                    right_sat > 40 and left_sat < 30 and
+                    right_std > 30 and
+                    left_brightness < 80 or left_brightness > 200
+                )
+
+                if is_panel:
+                    panel_width = x
+                    logger.info(f"UI panel detected on left: width={panel_width}")
+                    return True, panel_width
+
+        return False, 0
+
     def _check_content_at_edge(self, img: torch.Tensor, side: str, position: int) -> bool:
         """Проверяет, есть ли контент (не серый) на указанной позиции от края."""
         h, w = img.shape[:2]
@@ -529,12 +607,19 @@ class AutoBorderCrop:
 
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
 
-        # 3. Проверяем края — режем ТОЛЬКО если чисто серый/чёрный/белый И нет контента
+        # 3. Проверяем края — режем если чисто серый/чёрный/белый ИЛИ UI панель
         for side in ['left', 'right']:
             is_pure, edge_color = self._is_pure_border_color(img_gpu, side)
             detected_border = self._detect_border_gpu(img_gpu, side, sensitivity, min_border_size)
 
-            if is_pure and detected_border > 0:
+            # НОВОЕ: Детектируем UI панели (Instagram, браузер и т.д.)
+            is_ui_panel, panel_width = self._is_ui_panel(img_gpu, side)
+
+            if is_ui_panel and panel_width > 0:
+                # UI панель найдена — режем её
+                crop[side] = panel_width
+                logger.info(f"{side}: UI panel detected, crop={panel_width}")
+            elif is_pure and detected_border > 0:
                 # Дополнительная проверка — есть ли контент на границе обрезки
                 has_content = self._check_content_at_edge(img_gpu, side, detected_border)
 
