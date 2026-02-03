@@ -523,9 +523,15 @@ class AutoBorderCrop:
             Позиция границы для обрезки или None
         """
         h, w = img.shape[:2]
-        scan_step = 5  # Уменьшил шаг для узких рамок
+        scan_step = 5  # Маленький шаг для узких рамок
+
+        # Без content_bbox не можем подтвердить что это реальное фото
+        # В этом случае полагаемся на другие методы (is_pure, UI panel)
+        if content_bbox is None:
+            return None
 
         if side == 'left':
+            _, _, bx1, bx2 = content_bbox
             # Сканируем слева направо — ищем где заканчивается нейтральный фон
             prev_neutral = True
             for x in range(0, min(w // 2, 300), scan_step):
@@ -539,15 +545,15 @@ class AutoBorderCrop:
 
                 # Нашли переход: нейтральный → динамичный
                 if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    # Это граница — режем до неё
-                    if x > 0:  # Только если есть что резать
-                        logger.info(f"left: dynamics boundary at x={x}, crop={x}, std={strip_std:.1f}")
+                    # Проверяем что content_bbox подтверждает наличие контента справа от границы
+                    if bx1 <= x + scan_step * 3 and x > 0:
+                        logger.info(f"left: dynamics boundary at x={x}, crop={x}, std={strip_std:.1f}, bbox confirms")
                         return x
 
                 prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
 
         elif side == 'right':
-            # Сканируем справа налево
+            _, _, bx1, bx2 = content_bbox
             prev_neutral = True
             for x in range(w - scan_step, max(w // 2, w - 300), -scan_step):
                 strip = img[:, x:x + scan_step, :3]
@@ -559,14 +565,17 @@ class AutoBorderCrop:
                 is_neutral = self._is_neutral_color(strip_pixels)
 
                 if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    boundary = w - x - scan_step
-                    if boundary > 0:
-                        logger.info(f"right: dynamics boundary at x={x}, crop={boundary}, std={strip_std:.1f}")
-                        return boundary
+                    # Проверяем что content_bbox подтверждает наличие контента слева от границы
+                    if bx2 >= x - scan_step * 3:
+                        boundary = w - x - scan_step
+                        if boundary > 0:
+                            logger.info(f"right: dynamics boundary at x={x}, crop={boundary}, std={strip_std:.1f}, bbox confirms")
+                            return boundary
 
                 prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
 
         elif side == 'top':
+            by1, by2, _, _ = content_bbox
             prev_neutral = True
             for y in range(0, min(h // 2, 300), scan_step):
                 strip = img[y:y + scan_step, :, :3]
@@ -578,13 +587,15 @@ class AutoBorderCrop:
                 is_neutral = self._is_neutral_color(strip_pixels)
 
                 if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    if y > 0:
-                        logger.info(f"top: dynamics boundary at y={y}, crop={y}, std={strip_std:.1f}")
+                    # Проверяем что content_bbox подтверждает наличие контента ниже границы
+                    if by1 <= y + scan_step * 3 and y > 0:
+                        logger.info(f"top: dynamics boundary at y={y}, crop={y}, std={strip_std:.1f}, bbox confirms")
                         return y
 
                 prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
 
         elif side == 'bottom':
+            by1, by2, _, _ = content_bbox
             prev_neutral = True
             for y in range(h - scan_step, max(h // 2, h - 300), -scan_step):
                 strip = img[y:y + scan_step, :, :3]
@@ -596,10 +607,12 @@ class AutoBorderCrop:
                 is_neutral = self._is_neutral_color(strip_pixels)
 
                 if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    boundary = h - y - scan_step
-                    if boundary > 0:
-                        logger.info(f"bottom: dynamics boundary at y={y}, crop={boundary}, std={strip_std:.1f}")
-                        return boundary
+                    # Проверяем что content_bbox подтверждает наличие контента выше границы
+                    if by2 >= y - scan_step * 3:
+                        boundary = h - y - scan_step
+                        if boundary > 0:
+                            logger.info(f"bottom: dynamics boundary at y={y}, crop={boundary}, std={strip_std:.1f}, bbox confirms")
+                            return boundary
 
                 prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
 
