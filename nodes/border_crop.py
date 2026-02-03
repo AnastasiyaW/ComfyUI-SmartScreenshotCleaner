@@ -55,6 +55,16 @@ class AutoBorderCrop:
 
         return (image[0:1, y1:y2, x1:x2, :],)
 
+    def _is_grayscale_color(self, rgb: np.ndarray, saturation_threshold: float = 30.0) -> bool:
+        """Проверяет, является ли цвет оттенком серого (чёрный/белый/серый)."""
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        max_val = max(r, g, b)
+        min_val = min(r, g, b)
+
+        # Насыщенность (разница между макс и мин каналами)
+        saturation = max_val - min_val
+        return saturation < saturation_threshold
+
     def _detect_border(self, img, side, sensitivity, min_size):
         h, w = img.shape[:2]
 
@@ -72,14 +82,26 @@ class AutoBorderCrop:
             max_scan = w // 2
 
         ref_color = np.median(get_line(0).astype(np.float32), axis=0)
+
+        # Проверяем что первая линия однородная
         if np.std(get_line(0), axis=0).mean() > sensitivity * 2:
+            return 0
+
+        # Проверяем что это оттенок серого (чёрный/белый/серый), а не цветной
+        if not self._is_grayscale_color(ref_color):
             return 0
 
         border = 0
         for i in range(max_scan):
             line = get_line(i).astype(np.float32)
-            if np.abs(np.mean(line, axis=0) - ref_color).mean() < sensitivity:
-                border = i + 1
+            line_color = np.mean(line, axis=0)
+
+            # Проверяем однородность и что цвет остаётся серым
+            if np.abs(line_color - ref_color).mean() < sensitivity:
+                if self._is_grayscale_color(line_color):
+                    border = i + 1
+                else:
+                    break
             else:
                 break
 
