@@ -121,36 +121,19 @@ class AutoBorderCrop:
     SAFE_MARGIN_VERTICAL = 50      # Отступ сверху/снизу от контента
     SAFE_MARGIN_HORIZONTAL = 200   # Большой отступ слева/справа (защита рук)
 
-    # Константы — Edge detection
-    EDGE_SIZE = 30
-    CORNER_SIZE_RATIO = 4
-    MAX_CORNER_SIZE = 100
-    CHECK_DEPTH = 20               # Глубина проверки границы (пикселей)
-    LOOKAHEAD_PIXELS = 30          # Смотрим вперёд для проверки контента
+    # Константы — Edge detection (НОВЫЕ)
+    EDGE_CHECK_DEPTH = 10          # Узкая проверка края (10 пикселей)
+    SCAN_STEP = 3                  # Шаг сканирования для поиска границы
 
-    # Константы — Thresholds
-    UNIFORM_STD_THRESHOLD = 15.0   # Ниже = чистый однотонный фон
-    AMBIGUOUS_STD_LOW = 15.0       # Нижний порог неоднозначной зоны
-    AMBIGUOUS_STD_HIGH = 40.0      # Верхний порог неоднозначной зоны
-    DYNAMIC_STD_THRESHOLD = 50.0   # Выше = высокая динамика (контент)
-    CONTENT_STD_THRESHOLD = 40.0   # Порог для проверки контента
-    SEGMENT_STD_THRESHOLD = 20.0   # Порог динамики сегмента линии
-
-    # Константы — Color detection
-    SATURATION_THRESHOLD = 30.0    # Порог насыщенности для цветного контента
-    NEUTRAL_SATURATION = 25.0      # Ниже = нейтральный цвет (чёрный/серый/белый)
-    BLACK_THRESHOLD = 30           # Ниже = чёрный фон
-    WHITE_THRESHOLD = 225          # Выше = белый фон
-    COLOR_SATURATION_THRESHOLD = 20
-    COLORFUL_RATIO_THRESHOLD = 0.2 # 20% цветных пикселей = цветной контент
-    HIGH_DYNAMICS_STD = 50.0       # STD для игнорирования safe space
-    DYNAMICS_BOUNDARY_STD = 35.0   # Порог для границы динамики
+    # Константы — Thresholds (УПРОЩЁННЫЕ)
+    NEUTRAL_STD_THRESHOLD = 20.0   # STD < 20 = однотонная область
+    NEUTRAL_SATURATION = 25.0      # Насыщенность < 25 = нейтральный цвет (ч/б/серый)
+    CONTENT_STD_THRESHOLD = 30.0   # STD > 30 = начался контент
+    CONTENT_SATURATION = 20.0      # Насыщенность > 20 = цветной контент
 
     # Константы — Limits
     MIN_CONTENT_RATIO = 0.3        # Минимум 30% контента после обрезки
-    MIN_COVERAGE = 0.7             # Минимум 70% покрытия для контента
-    CONTENT_CONTINUE_RATIO = 0.6   # 60% линий для подтверждения контента
-    SECOND_PASS_SENSITIVITY_MULTIPLIER = 1.5
+    MIN_BORDER_TO_CUT = 5          # Минимум 5 пикселей для обрезки
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -242,146 +225,16 @@ class AutoBorderCrop:
             logger.warning(f"YOLO person detection failed: {e}")
             return None
 
-    def _find_sharp_content_edge(self, img: torch.Tensor, side: str, search_start: int, search_end: int) -> Tuple[Optional[int], Optional[int]]:
-        """Ищет чёткую границу контента (резкий переход от фона к контенту по всей длине линии).
+    def _is_edge_neutral(self, img: torch.Tensor, side: str) -> Tuple[bool, float, float]:
+        """Проверяет, является ли край нейтральным (чёрный/белый/серый).
 
-        Возвращает (sharp_edge, ambiguous_start):
-        - sharp_edge: позиция чёткой границы или None
-        - ambiguous_start: начало неоднозначной зоны (для LaMa) или None
+        Проверяем УЗКУЮ полосу (10px) от самого края.
 
-        Логика:
-        1. Чёткая граница = резкий скачок динамики пикселей по всей длине линии
-        2. Неоднозначная зона = переход (тень, градиент) между фоном и контентом
-        3. Если за неоднозначной зоной есть реальный объект — не режем, а LaMa заливает тень
+        Returns:
+            (is_neutral, std, saturation)
         """
         h, w = img.shape[:2]
-
-        if search_start >= search_end:
-            return None, None
-
-        # Определяем направление сканирования
-        if side == 'top':
-            get_line = lambda i: img[i, :, :3]
-            max_pos = h
-        elif side == 'bottom':
-            get_line = lambda i: img[h - 1 - i, :, :3]
-            max_pos = h
-        elif side == 'left':
-            get_line = lambda i: img[:, i, :3]
-            max_pos = w
-        else:  # right
-            get_line = lambda i: img[:, w - 1 - i, :3]
-            max_pos = w
-
-        prev_is_uniform = True
-        ambiguous_start = None
-        in_ambiguous_zone = False
-
-        for pos in range(search_start, min(search_end, max_pos)):
-            line = get_line(pos).float()
-            line_std = line.std(dim=0).mean().item()
-
-            # Проверяем яркость — чёрный/белый фон?
-            line_mean = line.mean().item()
-            is_bw_background = line_mean < self.BLACK_THRESHOLD or line_mean > self.WHITE_THRESHOLD
-
-            # Проверяем покрытие динамикой
-            num_segments = 10
-            if side in ('top', 'bottom'):
-                segment_size = max(1, w // num_segments)
-                segments_dynamic = 0
-                for seg in range(num_segments):
-                    seg_start = seg * segment_size
-                    seg_end = min((seg + 1) * segment_size, w)
-                    seg_pixels = line[seg_start:seg_end]
-                    if seg_pixels.numel() > 0:
-                        seg_std = seg_pixels.std(dim=0).mean().item()
-                        if seg_std > self.SEGMENT_STD_THRESHOLD:
-                            segments_dynamic += 1
-            else:
-                segment_size = max(1, h // num_segments)
-                segments_dynamic = 0
-                for seg in range(num_segments):
-                    seg_start = seg * segment_size
-                    seg_end = min((seg + 1) * segment_size, h)
-                    seg_pixels = line[seg_start:seg_end]
-                    if seg_pixels.numel() > 0:
-                        seg_std = seg_pixels.std(dim=0).mean().item()
-                        if seg_std > self.SEGMENT_STD_THRESHOLD:
-                            segments_dynamic += 1
-
-            coverage = segments_dynamic / num_segments
-            is_content_line = line_std > self.DYNAMIC_STD_THRESHOLD and coverage > self.MIN_COVERAGE
-
-            # Неоднозначная зона: не чистый фон, но и не контент (тень, градиент)
-            is_ambiguous = (self.AMBIGUOUS_STD_LOW < line_std < self.AMBIGUOUS_STD_HIGH and
-                           not is_bw_background and coverage < self.MIN_COVERAGE)
-
-            # Запоминаем начало неоднозначной зоны
-            if is_ambiguous and ambiguous_start is None and prev_is_uniform:
-                ambiguous_start = pos
-                in_ambiguous_zone = True
-                logger.info(f"{side}: ambiguous zone (shadow/gradient) starts at {pos}, std={line_std:.1f}")
-
-            # Нашли резкий переход к контенту
-            if is_content_line:
-                if in_ambiguous_zone:
-                    # За тенью/градиентом есть реальный объект — это часть фото!
-                    # Проверяем что объект продолжается дальше (не случайный шум)
-                    content_continues = self._check_content_continues(img, side, pos, self.LOOKAHEAD_PIXELS)
-                    if content_continues:
-                        # Реальный объект за тенью — не режем! LaMa заполнит тень
-                        logger.info(f"{side}: content found after shadow at {pos}, keeping object, LaMa will fill shadow")
-                        return None, ambiguous_start
-                    else:
-                        # Случайный шум — режем до начала неоднозначной зоны
-                        logger.info(f"{side}: found sharp edge at {pos} after ambiguous zone")
-                        return pos, ambiguous_start
-                elif prev_is_uniform:
-                    # Чистый переход фон -> контент
-                    logger.info(f"{side}: found sharp edge at {pos}, std={line_std:.1f}, coverage={coverage:.1%}")
-                    return pos, None
-
-            prev_is_uniform = line_std < self.AMBIGUOUS_STD_LOW
-            if not is_ambiguous:
-                in_ambiguous_zone = False
-
-        # Не нашли чёткую границу, но может быть неоднозначная зона
-        return None, ambiguous_start
-
-    def _check_content_continues(self, img: torch.Tensor, side: str, start_pos: int, lookahead: int) -> bool:
-        """Проверяет, продолжается ли контент дальше (не случайный шум).
-        Если контент стабильно высокой динамики на протяжении lookahead пикселей — это реальный объект.
-        """
-        h, w = img.shape[:2]
-
-        if side == 'top':
-            get_line = lambda i: img[i, :, :3] if i < h else None
-        elif side == 'bottom':
-            get_line = lambda i: img[h - 1 - i, :, :3] if i < h else None
-        elif side == 'left':
-            get_line = lambda i: img[:, i, :3] if i < w else None
-        else:
-            get_line = lambda i: img[:, w - 1 - i, :3] if i < w else None
-
-        content_lines = 0
-        for offset in range(lookahead):
-            line = get_line(start_pos + offset)
-            if line is None:
-                break
-            line_std = line.float().std(dim=0).mean().item()
-            if line_std > self.CONTENT_STD_THRESHOLD:
-                content_lines += 1
-
-        # Если больше CONTENT_CONTINUE_RATIO линий имеют высокую динамику — это реальный объект
-        ratio = content_lines / max(1, lookahead)
-        logger.info(f"{side}: content check at {start_pos}, {content_lines}/{lookahead} lines = {ratio:.1%}")
-        return ratio > self.CONTENT_CONTINUE_RATIO
-
-    def _is_pure_border_color(self, img: torch.Tensor, side: str, depth: int = 30) -> Tuple[bool, Optional[torch.Tensor]]:
-        """Проверяет, является ли край чисто чёрным/белым/серым.
-        Возвращает (is_pure, color) где color - медианный цвет края."""
-        h, w = img.shape[:2]
+        depth = self.EDGE_CHECK_DEPTH
 
         if side == 'left':
             strip = img[:, 0:depth, :3]
@@ -392,488 +245,158 @@ class AutoBorderCrop:
         else:  # bottom
             strip = img[h-depth:h, :, :3]
 
+        if strip.numel() == 0:
+            return True, 0, 0
+
         pixels = strip.reshape(-1, 3).float()
-        median = pixels.median(dim=0).values
+
+        # STD — однородность
         std = pixels.std(dim=0).mean().item()
 
-        # Проверяем насыщенность (серый = низкая насыщенность)
-        saturation = (median.max() - median.min()).item()
-        mean_brightness = median.mean().item()
+        # Насыщенность — цветность (R≈G≈B = низкая насыщенность = нейтральный)
+        saturation = (pixels.max(dim=1).values - pixels.min(dim=1).values).mean().item()
 
-        # Чистый край: низкая std, низкая насыщенность, и либо тёмный либо светлый
-        is_pure = (std < self.UNIFORM_STD_THRESHOLD and
-                   saturation < self.SATURATION_THRESHOLD and
-                   (mean_brightness < 50 or mean_brightness > 200))
+        is_neutral = std < self.NEUTRAL_STD_THRESHOLD and saturation < self.NEUTRAL_SATURATION
 
-        return is_pure, median
+        return is_neutral, std, saturation
 
-    def _is_ui_panel(self, img: torch.Tensor, side: str, depth: int = 100) -> Tuple[bool, int]:
-        """Детектирует UI панель (Instagram, браузер и т.д.) по контрасту с контентом.
+    def _find_content_boundary(self, img: torch.Tensor, side: str) -> int:
+        """Находит границу где заканчивается нейтральный фон и начинается контент.
 
-        UI панель характеризуется:
-        1. Низкая насыщенность (серый/тёмный фон)
-        2. Резкая вертикальная граница с цветным контентом
-        3. Относительно однородный фон (даже если есть текст)
-
-        Возвращает (is_panel, panel_width).
-        """
-        h, w = img.shape[:2]
-
-        if side == 'right':
-            # Сканируем справа налево, ищем границу контента
-            for x in range(w - 10, max(w // 2, w - depth * 5), -10):
-                # Полоса слева от текущей позиции (контент)
-                left_strip = img[:, max(0, x - 50):x, :3]
-                # Полоса справа от текущей позиции (потенциальная панель)
-                right_strip = img[:, x:min(w, x + 50), :3]
-
-                if left_strip.numel() == 0 or right_strip.numel() == 0:
-                    continue
-
-                # Характеристики левой части (контент)
-                left_pixels = left_strip.reshape(-1, 3).float()
-                left_sat = (left_pixels.max(dim=1).values - left_pixels.min(dim=1).values).mean().item()
-                left_std = left_strip.float().std().item()
-
-                # Характеристики правой части (панель)
-                right_pixels = right_strip.reshape(-1, 3).float()
-                right_sat = (right_pixels.max(dim=1).values - right_pixels.min(dim=1).values).mean().item()
-                right_std = right_strip.float().std().item()
-                right_brightness = right_pixels.mean().item()
-
-                # UI панель: справа низкая насыщенность, слева высокая
-                # И справа относительно однородный тёмный/светлый фон
-                is_panel = (
-                    left_sat > 40 and right_sat < 30 and  # Контраст по насыщенности
-                    left_std > 30 and  # Слева есть динамика
-                    right_brightness < 80 or right_brightness > 200  # Тёмная или светлая панель
-                )
-
-                if is_panel:
-                    panel_width = w - x
-                    logger.info(f"UI panel detected on right: width={panel_width}, "
-                               f"left_sat={left_sat:.1f}, right_sat={right_sat:.1f}")
-                    return True, panel_width
-
-        elif side == 'left':
-            # Аналогично для левой стороны
-            for x in range(10, min(w // 2, depth * 5), 10):
-                right_strip = img[:, x:min(w, x + 50), :3]
-                left_strip = img[:, max(0, x - 50):x, :3]
-
-                if left_strip.numel() == 0 or right_strip.numel() == 0:
-                    continue
-
-                left_pixels = left_strip.reshape(-1, 3).float()
-                left_sat = (left_pixels.max(dim=1).values - left_pixels.min(dim=1).values).mean().item()
-                left_brightness = left_pixels.mean().item()
-
-                right_pixels = right_strip.reshape(-1, 3).float()
-                right_sat = (right_pixels.max(dim=1).values - right_pixels.min(dim=1).values).mean().item()
-                right_std = right_strip.float().std().item()
-
-                is_panel = (
-                    right_sat > 40 and left_sat < 30 and
-                    right_std > 30 and
-                    left_brightness < 80 or left_brightness > 200
-                )
-
-                if is_panel:
-                    panel_width = x
-                    logger.info(f"UI panel detected on left: width={panel_width}")
-                    return True, panel_width
-
-        return False, 0
-
-    def _is_neutral_color(self, pixels: torch.Tensor) -> bool:
-        """Проверяет, являются ли пиксели нейтральными (чёрный/серый/белый).
-        Нейтральный = низкая насыщенность (R ≈ G ≈ B).
-        """
-        if pixels.numel() == 0:
-            return True
-        saturation = (pixels.max(dim=-1).values - pixels.min(dim=-1).values).float().mean().item()
-        return saturation < self.NEUTRAL_SATURATION
-
-    def _classify_edge_type(self, img: torch.Tensor, side: str, depth: int = 50) -> str:
-        """Классифицирует тип края изображения.
-
-        Возвращает один из трёх типов:
-        1. 'dynamic_colorful' — высокая динамика цветов (фото) — НЕ РЕЗАТЬ
-        2. 'uniform_neutral' — равномерный нейтральный (чёрный/серый/белый) — МОЖНО РЕЗАТЬ
-        3. 'uniform_colorful' — равномерный цветной (розовый, голубой и т.д.) — НЕ РЕЗАТЬ
-
-        Логика:
-        - Сначала проверяем динамику (STD) — высокая = фото
-        - Потом проверяем насыщенность — высокая = цветной
-        - Если низкая динамика + низкая насыщенность = нейтральный фон
-        """
-        h, w = img.shape[:2]
-
-        # Получаем полосу края
-        if side == 'left':
-            strip = img[:, 0:depth, :3]
-        elif side == 'right':
-            strip = img[:, w-depth:w, :3]
-        elif side == 'top':
-            strip = img[0:depth, :, :3]
-        else:  # bottom
-            strip = img[h-depth:h, :, :3]
-
-        if strip.numel() == 0:
-            return 'uniform_neutral'
-
-        pixels = strip.reshape(-1, 3).float()
-
-        # 1. Проверяем динамику (вариативность цветов)
-        strip_std = pixels.std(dim=0).mean().item()
-
-        # 2. Проверяем насыщенность (цветность)
-        # Насыщенность = max(R,G,B) - min(R,G,B) для каждого пикселя
-        max_ch = pixels.max(dim=1).values
-        min_ch = pixels.min(dim=1).values
-        saturation_per_pixel = max_ch - min_ch
-        mean_saturation = saturation_per_pixel.mean().item()
-
-        # Процент цветных пикселей (насыщенность > порога)
-        colorful_ratio = (saturation_per_pixel > self.SATURATION_THRESHOLD).float().mean().item()
-
-        # 3. Проверяем яркость (для определения чёрный/белый)
-        mean_brightness = pixels.mean().item()
-
-        # Классификация
-        # Высокая динамика = фото с разнообразием цветов
-        if strip_std > self.DYNAMIC_STD_THRESHOLD:
-            logger.info(f"{side}: DYNAMIC_COLORFUL (std={strip_std:.1f} > {self.DYNAMIC_STD_THRESHOLD})")
-            return 'dynamic_colorful'
-
-        # Низкая динамика — проверяем цветность
-        # Если много цветных пикселей — это равномерный цветной фон (небо, стена)
-        if colorful_ratio > 0.3 or mean_saturation > self.SATURATION_THRESHOLD:
-            logger.info(f"{side}: UNIFORM_COLORFUL (colorful_ratio={colorful_ratio:.1%}, sat={mean_saturation:.1f})")
-            return 'uniform_colorful'
-
-        # Низкая динамика + низкая насыщенность = нейтральный
-        # Дополнительно проверяем что это чёрный/серый/белый
-        is_dark = mean_brightness < 50
-        is_light = mean_brightness > 200
-        is_gray = 50 <= mean_brightness <= 200 and mean_saturation < 20
-
-        if is_dark or is_light or is_gray:
-            logger.info(f"{side}: UNIFORM_NEUTRAL (brightness={mean_brightness:.1f}, sat={mean_saturation:.1f}, std={strip_std:.1f})")
-            return 'uniform_neutral'
-
-        # Неопределённый случай — считаем цветным для безопасности
-        logger.info(f"{side}: UNIFORM_COLORFUL (fallback, brightness={mean_brightness:.1f}, sat={mean_saturation:.1f})")
-        return 'uniform_colorful'
-
-    def _find_dynamics_boundary(self, img: torch.Tensor, side: str, content_bbox: Optional[Tuple]) -> Optional[int]:
-        """Находит границу между областью с высокой динамикой (фото) и нейтральным фоном.
-
-        Логика:
-        1. Если YOLO нашёл объект внутри области с высокой динамикой — это контент
-        2. Сканируем от края к центру, ищем где начинается динамика
-        3. Возвращаем позицию границы для обрезки
-
-        Args:
-            img: Изображение [H, W, C] в формате 0-255
-            side: Сторона ('left', 'right', 'top', 'bottom')
-            content_bbox: Bbox контента (y1, y2, x1, x2) или None
+        Сканирует от края к центру, ищет где:
+        1. Появляется высокая динамика (STD > порог) — фото
+        2. Появляется цвет (насыщенность > порог) — цветной контент
 
         Returns:
-            Позиция границы для обрезки или None
+            Количество пикселей для обрезки (0 если резать нечего)
         """
         h, w = img.shape[:2]
-        scan_step = 5  # Маленький шаг для узких рамок
+        step = self.SCAN_STEP
 
-        if side == 'left':
-            # Сканируем слева направо — ищем где заканчивается нейтральный фон
-            prev_neutral = True
-            for x in range(0, min(w // 2, 300), scan_step):
-                strip = img[:, x:x + scan_step, :3]
-                if strip.numel() == 0:
-                    continue
-
-                strip_pixels = strip.reshape(-1, 3).float()
-                strip_std = strip.float().std().item()
-                is_neutral = self._is_neutral_color(strip_pixels)
-
-                # Нашли переход: нейтральный → динамичный цветной
-                if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    # Есть цветная динамика — режем по границе
-                    if x > 0:
-                        logger.info(f"left: dynamics boundary at x={x}, crop={x}, std={strip_std:.1f}")
-                        return x
-
-                prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
-
-            # Не нашли цветную динамику — фото на однотонном фоне
-            # Используем content_bbox чтобы не срезать человека
-            # return None — пусть другие методы обработают с учётом safe space
-
-        elif side == 'right':
-            prev_neutral = True
-            for x in range(w - scan_step, max(w // 2, w - 300), -scan_step):
-                strip = img[:, x:x + scan_step, :3]
-                if strip.numel() == 0:
-                    continue
-
-                strip_pixels = strip.reshape(-1, 3).float()
-                strip_std = strip.float().std().item()
-                is_neutral = self._is_neutral_color(strip_pixels)
-
-                if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    boundary = w - x - scan_step
-                    if boundary > 0:
-                        logger.info(f"right: dynamics boundary at x={x}, crop={boundary}, std={strip_std:.1f}")
-                        return boundary
-
-                prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
-
-        elif side == 'top':
-            prev_neutral = True
-            for y in range(0, min(h // 2, 300), scan_step):
-                strip = img[y:y + scan_step, :, :3]
-                if strip.numel() == 0:
-                    continue
-
-                strip_pixels = strip.reshape(-1, 3).float()
-                strip_std = strip.float().std().item()
-                is_neutral = self._is_neutral_color(strip_pixels)
-
-                if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    if y > 0:
-                        logger.info(f"top: dynamics boundary at y={y}, crop={y}, std={strip_std:.1f}")
-                        return y
-
-                prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
-
+        if side == 'top':
+            max_scan = h // 2
+            get_strip = lambda pos: img[pos:pos+step, :, :3]
         elif side == 'bottom':
-            prev_neutral = True
-            for y in range(h - scan_step, max(h // 2, h - 300), -scan_step):
-                strip = img[y:y + scan_step, :, :3]
-                if strip.numel() == 0:
-                    continue
+            max_scan = h // 2
+            get_strip = lambda pos: img[h-pos-step:h-pos, :, :3]
+        elif side == 'left':
+            max_scan = w // 2
+            get_strip = lambda pos: img[:, pos:pos+step, :3]
+        else:  # right
+            max_scan = w // 2
+            get_strip = lambda pos: img[:, w-pos-step:w-pos, :3]
 
-                strip_pixels = strip.reshape(-1, 3).float()
-                strip_std = strip.float().std().item()
-                is_neutral = self._is_neutral_color(strip_pixels)
+        border_size = 0
 
-                if prev_neutral and strip_std > self.DYNAMICS_BOUNDARY_STD and not is_neutral:
-                    boundary = h - y - scan_step
-                    if boundary > 0:
-                        logger.info(f"bottom: dynamics boundary at y={y}, crop={boundary}, std={strip_std:.1f}")
-                        return boundary
+        for pos in range(0, max_scan, step):
+            strip = get_strip(pos)
+            if strip.numel() == 0:
+                break
 
-                prev_neutral = is_neutral and strip_std < self.DYNAMICS_BOUNDARY_STD
+            pixels = strip.reshape(-1, 3).float()
 
-        # Не нашли цветную динамику — return None
-        # Другие методы (is_pure, safe space с content_bbox) обработают
-        return None
+            # Проверяем динамику
+            std = pixels.std(dim=0).mean().item()
 
-    def _check_content_at_edge(self, img: torch.Tensor, side: str, position: int) -> bool:
-        """Проверяет, есть ли контент (не серый) на указанной позиции от края."""
-        h, w = img.shape[:2]
+            # Проверяем насыщенность
+            saturation = (pixels.max(dim=1).values - pixels.min(dim=1).values).mean().item()
 
-        if side == 'left':
-            strip = img[:, position:position+5, :3] if position < w else None
-        elif side == 'right':
-            pos = w - position - 5
-            strip = img[:, max(0, pos):w-position, :3] if position < w else None
-        elif side == 'top':
-            strip = img[position:position+5, :, :3] if position < h else None
-        else:  # bottom
-            pos = h - position - 5
-            strip = img[max(0, pos):h-position, :, :3] if position < h else None
+            # Если нашли контент — стоп
+            if std > self.CONTENT_STD_THRESHOLD or saturation > self.CONTENT_SATURATION:
+                logger.info(f"{side}: content found at {pos}, std={std:.1f}, sat={saturation:.1f}")
+                break
 
-        if strip is None or strip.numel() == 0:
-            return False
+            # Если всё ещё нейтральный — продолжаем
+            if std < self.NEUTRAL_STD_THRESHOLD and saturation < self.NEUTRAL_SATURATION:
+                border_size = pos + step
+            else:
+                # Переходная зона — стоп, не режем дальше
+                logger.info(f"{side}: transition zone at {pos}, std={std:.1f}, sat={saturation:.1f}")
+                break
 
-        pixels = strip.reshape(-1, 3).float()
-
-        # Проверяем насыщенность — если есть цветные пиксели, это контент
-        max_ch = pixels.max(dim=1).values
-        min_ch = pixels.min(dim=1).values
-        saturation = max_ch - min_ch
-
-        # Проверяем яркость — не чисто чёрный/белый
-        brightness = pixels.mean(dim=1)
-
-        # Контент = цветные пиксели ИЛИ средняя яркость (не чёрное/белое)
-        color_content = (saturation > 30).float().mean().item()
-        brightness_content = ((brightness > 40) & (brightness < 220)).float().mean().item()
-
-        has_content = color_content > 0.1 or brightness_content > 0.3
-        return has_content
-
-    def _is_colorful_content_at_border(self, img: torch.Tensor, side: str, border_pos: int) -> bool:
-        """Проверяет, есть ли ЦВЕТНОЙ контент на границе обрезки.
-
-        Если цветной (не чёрно-белый/серый) — это точно не фон для обрезки,
-        safe space не нужен, режем рамку полностью.
-
-        Цветной = насыщенность > 30 (разница между max и min каналов RGB).
-        Даже равномерное голубое небо — это цветной контент.
-        """
-        h, w = img.shape[:2]
-        check_depth = self.CHECK_DEPTH
-
-        if side == 'left':
-            if border_pos >= w:
-                return False
-            strip = img[:, border_pos:min(border_pos + check_depth, w), :3]
-        elif side == 'right':
-            pos = w - border_pos
-            if pos <= 0:
-                return False
-            strip = img[:, max(0, pos - check_depth):pos, :3]
-        elif side == 'top':
-            if border_pos >= h:
-                return False
-            strip = img[border_pos:min(border_pos + check_depth, h), :, :3]
-        else:  # bottom
-            pos = h - border_pos
-            if pos <= 0:
-                return False
-            strip = img[max(0, pos - check_depth):pos, :, :3]
-
-        if strip.numel() == 0:
-            return False
-
-        # Проверяем насыщенность (цветной контент)
-        pixels = strip.reshape(-1, 3).float()
-        saturation = (pixels.max(dim=1).values - pixels.min(dim=1).values)
-        color_ratio = (saturation > self.SATURATION_THRESHOLD).float().mean().item()
-
-        # Также проверяем высокую динамику — это тоже явный контент
-        strip_std = strip.float().std(dim=(0, 1)).mean().item()
-
-        # Цветной контент ИЛИ высокая динамика = не серый фон, safe space не нужен
-        is_colorful = color_ratio > self.COLORFUL_RATIO_THRESHOLD or strip_std > self.HIGH_DYNAMICS_STD
-
-        if is_colorful:
-            logger.info(f"{side}: colorful/dynamic content at border {border_pos}, color={color_ratio:.1%}, std={strip_std:.1f} -> ignore safe space")
-
-        return is_colorful
+        return border_size if border_size >= self.MIN_BORDER_TO_CUT else 0
 
     def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Обрабатывает одно изображение полностью на GPU.
+        """Обрабатывает одно изображение — НОВАЯ УПРОЩЁННАЯ ЛОГИКА.
+
+        Алгоритм:
+        1. Для каждой стороны проверяем узкую полосу (10px) от края
+        2. Если полоса нейтральная (чёрная/белая/серая) — ищем границу контента
+        3. Режем до границы контента
+        4. Применяем safe space от YOLO bbox (если есть человек)
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - Обрезанное изображение [H', W', C]
-                - Debug маска краёв [H, W] — где 1=область для обрезки
-                - Debug изображение с bbox [H, W, C] — оригинал с нарисованным bbox
+            Tuple[cropped_image, debug_mask, debug_bbox_image]
         """
         img_gpu = (image.to(device) * 255.0).float()
         h, w = img_gpu.shape[:2]
-        need_lama = False
 
-        # Создаём debug маску (будем отмечать области для обрезки)
+        # Debug маска
         debug_mask = torch.zeros(h, w, device=device)
 
-        # 1. Пробуем детектировать человека через YOLO
+        # 1. Детектируем человека через YOLO (для safe space)
         person_bbox = self._detect_person_bbox_yolo(img_gpu, device)
 
-        # 2. Fallback на детекцию контента по цвету
-        content_bbox = self._find_content_bbox_gpu(img_gpu)
-
-        # Объединяем bbox'ы
-        if person_bbox and content_bbox:
-            py1, py2, px1, px2 = person_bbox
-            cy1, cy2, cx1, cx2 = content_bbox
-            final_bbox = (min(py1, cy1), max(py2, cy2), min(px1, cx1), max(px2, cx2))
-            logger.info(f"Combined bbox (person + content): {final_bbox}")
-        elif person_bbox:
-            final_bbox = person_bbox
-            logger.info(f"Using person bbox: {final_bbox}")
-        else:
-            final_bbox = content_bbox
-            logger.info(f"Using content bbox: {final_bbox}")
-
-        # Создаём debug изображение с bbox
-        debug_bbox_img = self._create_debug_bbox_image(img_gpu, final_bbox, person_bbox, content_bbox)
+        # Debug изображение
+        debug_bbox_img = self._create_debug_bbox_image(img_gpu, person_bbox, person_bbox, None)
 
         crop = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
 
-        # 3. НОВАЯ ЛОГИКА: Классифицируем каждый край по трём типам
-        edge_types = {}
-        for side in ['left', 'right', 'top', 'bottom']:
-            edge_types[side] = self._classify_edge_type(img_gpu, side)
+        # 2. Для каждой стороны: проверяем край и ищем границу
+        for side in ['top', 'bottom', 'left', 'right']:
+            is_neutral, std, sat = self._is_edge_neutral(img_gpu, side)
 
-        logger.info(f"Edge classification: {edge_types}")
-
-        # 4. Обрабатываем каждую сторону по новой логике
-        for side in ['left', 'right', 'top', 'bottom']:
-            edge_type = edge_types[side]
-
-            # Тип 1: dynamic_colorful — фото с высокой динамикой — НЕ РЕЗАТЬ
-            if edge_type == 'dynamic_colorful':
-                logger.info(f"{side}: DYNAMIC_COLORFUL — NOT cropping (photo content)")
-                crop[side] = 0
+            if not is_neutral:
+                # Край не нейтральный — не режем
+                logger.info(f"{side}: edge NOT neutral (std={std:.1f}, sat={sat:.1f}) — skip")
                 continue
 
-            # Тип 3: uniform_colorful — равномерный цветной (розовое небо) — НЕ РЕЗАТЬ
-            if edge_type == 'uniform_colorful':
-                logger.info(f"{side}: UNIFORM_COLORFUL — NOT cropping (colored background like sky)")
-                crop[side] = 0
+            # Край нейтральный — ищем где начинается контент
+            border = self._find_content_boundary(img_gpu, side)
+
+            if border < self.MIN_BORDER_TO_CUT:
+                logger.info(f"{side}: neutral edge but border too small ({border}px) — skip")
                 continue
 
-            # Тип 2: uniform_neutral — чёрный/серый/белый фон — МОЖНО РЕЗАТЬ
-            # Но проверяем что это действительно рамка, а не часть фото
-            detected_border = self._detect_border_gpu(img_gpu, side, sensitivity, min_border_size)
+            # Применяем safe space если есть person bbox
+            if person_bbox:
+                py1, py2, px1, px2 = person_bbox
+                if side == 'top':
+                    safe_limit = max(0, py1 - self.SAFE_MARGIN_VERTICAL)
+                elif side == 'bottom':
+                    safe_limit = max(0, h - py2 - self.SAFE_MARGIN_VERTICAL)
+                elif side == 'left':
+                    safe_limit = max(0, px1 - self.SAFE_MARGIN_HORIZONTAL)
+                else:  # right
+                    safe_limit = max(0, w - px2 - self.SAFE_MARGIN_HORIZONTAL)
 
-            if detected_border <= 0:
-                logger.info(f"{side}: UNIFORM_NEUTRAL but no border detected")
-                crop[side] = 0
-                continue
-
-            # Проверяем safe space если есть bbox объекта
-            if final_bbox:
-                by1, by2, bx1, bx2 = final_bbox
-
-                if side == 'left':
-                    safe_limit = max(0, bx1 - self.SAFE_MARGIN_HORIZONTAL)
-                elif side == 'right':
-                    safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
-                elif side == 'top':
-                    safe_limit = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
-                else:  # bottom
-                    safe_limit = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
-
-                # Ограничиваем обрезку safe limit'ом
-                final_crop = min(detected_border, safe_limit) if safe_limit > 0 else detected_border
-                crop[side] = final_crop
-                logger.info(f"{side}: UNIFORM_NEUTRAL, detected={detected_border}, safe_limit={safe_limit}, crop={final_crop}")
+                final_border = min(border, safe_limit) if safe_limit > 0 else border
+                logger.info(f"{side}: neutral, border={border}, safe_limit={safe_limit}, final={final_border}")
             else:
-                crop[side] = detected_border
-                logger.info(f"{side}: UNIFORM_NEUTRAL, no bbox, crop={detected_border}")
+                final_border = border
+                logger.info(f"{side}: neutral, border={final_border} (no person bbox)")
+
+            crop[side] = final_border
 
             # Отмечаем в debug маске
-            if crop[side] > 0:
-                if side == 'left':
-                    debug_mask[:, :crop[side]] = 1.0
-                elif side == 'right':
-                    debug_mask[:, w-crop[side]:] = 1.0
-                elif side == 'top':
-                    debug_mask[:crop[side], :] = 1.0
-                else:  # bottom
-                    debug_mask[h-crop[side]:, :] = 1.0
-
-        if need_lama and final_bbox:
-            top_type = self._analyze_edge_strip_gpu(img_gpu, 'top')
-            bottom_type = self._analyze_edge_strip_gpu(img_gpu, 'bottom')
-            img_gpu = self._apply_lama_to_borders_gpu(img_gpu, crop, final_bbox, top_type, bottom_type)
+            if final_border > 0:
+                if side == 'top':
+                    debug_mask[:final_border, :] = 1.0
+                elif side == 'bottom':
+                    debug_mask[h-final_border:, :] = 1.0
+                elif side == 'left':
+                    debug_mask[:, :final_border] = 1.0
+                else:  # right
+                    debug_mask[:, w-final_border:] = 1.0
 
         logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
+        # 3. Применяем обрезку
         new_h = h - crop['top'] - crop['bottom']
         new_w = w - crop['left'] - crop['right']
 
         if new_h < h * self.MIN_CONTENT_RATIO or new_w < w * self.MIN_CONTENT_RATIO:
-            logger.warning(
-                f"Crop too aggressive: {new_h}x{new_w} < {h * self.MIN_CONTENT_RATIO:.0f}x{w * self.MIN_CONTENT_RATIO:.0f}, "
-                f"returning original image"
-            )
+            logger.warning(f"Crop too aggressive: {new_h}x{new_w}, returning original")
             return ((img_gpu / 255.0).clamp(0, 1).cpu(), debug_mask.cpu(), debug_bbox_img.cpu())
 
         y1 = crop['top']
@@ -882,7 +405,7 @@ class AutoBorderCrop:
         x2 = w - crop['right'] if crop['right'] > 0 else w
 
         if y1 >= y2 or x1 >= x2:
-            logger.warning(f"Invalid crop bounds: y1={y1}, y2={y2}, x1={x1}, x2={x2}, returning original")
+            logger.warning(f"Invalid crop bounds, returning original")
             return ((img_gpu / 255.0).clamp(0, 1).cpu(), debug_mask.cpu(), debug_bbox_img.cpu())
 
         result = (img_gpu[y1:y2, x1:x2] / 255.0).clamp(0, 1).cpu()
@@ -890,267 +413,26 @@ class AutoBorderCrop:
 
     def _create_debug_bbox_image(self, img_gpu: torch.Tensor, final_bbox: Optional[Tuple],
                                   person_bbox: Optional[Tuple], content_bbox: Optional[Tuple]) -> torch.Tensor:
-        """Создаёт debug изображение с нарисованными bbox'ами.
-
-        Цвета:
-        - Зелёный: final_bbox (итоговый)
-        - Синий: person_bbox (YOLO)
-        - Жёлтый: content_bbox (по цвету)
-        """
+        """Создаёт debug изображение с bbox."""
         debug_img = img_gpu.clone()
         h, w = debug_img.shape[:2]
         line_width = max(2, min(h, w) // 200)
 
         def draw_rect(img, y1, y2, x1, x2, color, width=2):
-            """Рисует прямоугольник на изображении."""
             y1, y2 = max(0, y1), min(h, y2)
             x1, x2 = max(0, x1), min(w, x2)
-
-            # Верхняя линия
             img[y1:y1+width, x1:x2, :3] = color
-            # Нижняя линия
             img[y2-width:y2, x1:x2, :3] = color
-            # Левая линия
             img[y1:y2, x1:x1+width, :3] = color
-            # Правая линия
             img[y1:y2, x2-width:x2, :3] = color
 
-        # Рисуем content_bbox (жёлтый)
-        if content_bbox:
-            cy1, cy2, cx1, cx2 = content_bbox
-            draw_rect(debug_img, cy1, cy2, cx1, cx2,
-                     torch.tensor([255, 255, 0], device=img_gpu.device, dtype=img_gpu.dtype),
-                     line_width)
-
-        # Рисуем person_bbox (синий)
         if person_bbox:
             py1, py2, px1, px2 = person_bbox
             draw_rect(debug_img, py1, py2, px1, px2,
-                     torch.tensor([0, 100, 255], device=img_gpu.device, dtype=img_gpu.dtype),
+                     torch.tensor([0, 255, 0], device=img_gpu.device, dtype=img_gpu.dtype),
                      line_width)
 
-        # Рисуем final_bbox (зелёный) — поверх остальных
-        if final_bbox:
-            fy1, fy2, fx1, fx2 = final_bbox
-            draw_rect(debug_img, fy1, fy2, fx1, fx2,
-                     torch.tensor([0, 255, 0], device=img_gpu.device, dtype=img_gpu.dtype),
-                     line_width + 1)
-
         return (debug_img / 255.0).clamp(0, 1)
-
-    def _get_border_color_gpu(self, img: torch.Tensor, side: str) -> torch.Tensor:
-        """Получает РЕАЛЬНЫЙ цвет рамки для заливки на GPU (без нормализации)."""
-        h, w = img.shape[:2]
-        sample_size = 10
-
-        if side == 'top':
-            sample = img[0:sample_size, :, :3]
-        else:
-            sample = img[h-sample_size:h, :, :3]
-
-        pixels = sample.reshape(-1, 3)
-        median = pixels.median(dim=0).values
-        # Возвращаем реальный цвет БЕЗ нормализации к чёрному/белому
-        return median
-
-    def _apply_lama_to_borders_gpu(self, img_gpu: torch.Tensor, crop: Dict[str, int], content_bbox: Tuple[int, int, int, int], top_type: str, bottom_type: str) -> torch.Tensor:
-        """Применяет LaMa для mixed областей."""
-        if not HAS_LAMA:
-            logger.warning("LaMa not available, skipping border inpainting")
-            return img_gpu
-
-        try:
-            h, w = img_gpu.shape[:2]
-            by1, by2, bx1, bx2 = content_bbox
-
-            mask_gpu = torch.zeros(h, w, device=img_gpu.device, dtype=torch.uint8)
-
-            if top_type == 'mixed':
-                top_border = self._detect_border_gpu(img_gpu, 'top', 15, 5)
-                safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
-                if top_border > safe_top:
-                    mask_gpu[safe_top:top_border, :] = 255
-
-            if bottom_type == 'mixed':
-                bottom_border = self._detect_border_gpu(img_gpu, 'bottom', 15, 5)
-                safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
-                if bottom_border > safe_bottom:
-                    mask_gpu[h-bottom_border:h-safe_bottom, :] = 255
-
-            if mask_gpu.max() == 0:
-                return img_gpu
-
-            logger.info("Applying LaMa for mixed border areas")
-
-            img_np = img_gpu.cpu().numpy().astype(np.uint8)
-            mask_np = mask_gpu.cpu().numpy()
-
-            lama = SimpleLama()
-            result = lama(Image.fromarray(img_np), Image.fromarray(mask_np))
-
-            return torch.from_numpy(np.array(result)).float().to(img_gpu.device)
-
-        except Exception as e:
-            logger.warning(f"LaMa failed: {e}")
-            return img_gpu
-
-    def _analyze_edge_strip_gpu(self, img: torch.Tensor, side: str) -> str:
-        """Анализирует полосу с края на GPU: uniform, dynamic, mixed."""
-        h, w = img.shape[:2]
-
-        if side == 'top':
-            strip = img[0:self.EDGE_SIZE, :, :3]
-        elif side == 'bottom':
-            strip = img[h-self.EDGE_SIZE:h, :, :3]
-        elif side == 'left':
-            strip = img[:, 0:self.EDGE_SIZE, :3]
-        else:
-            strip = img[:, w-self.EDGE_SIZE:w, :3]
-
-        pixels = strip.reshape(-1, 3).float()
-        std = pixels.std(dim=0).mean().item()
-        median = pixels.median(dim=0).values
-        saturation = (median.max() - median.min()).item()
-
-        if std < self.UNIFORM_STD_THRESHOLD and saturation < self.SATURATION_THRESHOLD:
-            return 'uniform'
-        elif std > self.DYNAMIC_STD_THRESHOLD:
-            return 'dynamic'
-        else:
-            return 'mixed'
-
-    def _find_content_bbox_gpu(self, img: torch.Tensor) -> Optional[Tuple[int, int, int, int]]:
-        """Находит bbox контента на GPU (не чёрное/белое/серое)."""
-        h, w = img.shape[:2]
-
-        if img.shape[2] >= 3:
-            gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
-        else:
-            gray = img[:, :, 0]
-
-        content_mask = ((gray > self.BLACK_THRESHOLD) & (gray < self.WHITE_THRESHOLD)).float()
-
-        if img.shape[2] >= 3:
-            max_ch = img[:, :, :3].max(dim=2).values
-            min_ch = img[:, :, :3].min(dim=2).values
-            saturation = max_ch - min_ch
-            color_mask = (saturation > self.COLOR_SATURATION_THRESHOLD).float()
-            content_mask = torch.maximum(content_mask, color_mask)
-
-        content_mask = _morphology_open_close_gpu(content_mask, kernel_size=5)
-
-        coords = torch.where(content_mask > 0.5)
-        if len(coords[0]) == 0:
-            return None
-
-        y1 = coords[0].min().item()
-        y2 = coords[0].max().item()
-        x1 = coords[1].min().item()
-        x2 = coords[1].max().item()
-
-        return (y1, y2, x1, x2)
-
-    def _is_grayscale_color_gpu(self, rgb: torch.Tensor) -> bool:
-        """Проверяет, является ли цвет оттенком серого на GPU."""
-        saturation = rgb.max() - rgb.min()
-        return saturation.item() < self.SATURATION_THRESHOLD
-
-    def _detect_border_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int) -> int:
-        """Двойной проход детекции рамки на GPU."""
-        border_pass1 = self._detect_border_by_lines_gpu(img, side, sensitivity, min_size)
-        border_pass2 = self._detect_border_by_corner_gpu(img, side, sensitivity, min_size, border_pass1)
-        return max(border_pass1, border_pass2)
-
-    def _detect_border_by_lines_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int) -> int:
-        """Проход 1: детекция по полным линиям на GPU."""
-        h, w = img.shape[:2]
-
-        if side == 'top':
-            get_line = lambda i: img[i, :, :3]
-            max_scan = h // 2
-        elif side == 'bottom':
-            get_line = lambda i: img[h-1-i, :, :3]
-            max_scan = h // 2
-        elif side == 'left':
-            get_line = lambda i: img[:, i, :3]
-            max_scan = w // 2
-        else:
-            get_line = lambda i: img[:, w-1-i, :3]
-            max_scan = w // 2
-
-        sample_lines = min(5, max_scan)
-        sample_pixels = torch.cat([get_line(i) for i in range(sample_lines)], dim=0).float()
-        ref_color = sample_pixels.median(dim=0).values
-
-        if not self._is_grayscale_color_gpu(ref_color):
-            return 0
-
-        border = 0
-        for i in range(max_scan):
-            line = get_line(i).float()
-            line_median = line.median(dim=0).values
-
-            if self._is_grayscale_color_gpu(line_median):
-                diff = (line_median - ref_color).abs().mean().item()
-                if diff < sensitivity:
-                    border = i + 1
-                else:
-                    break
-            else:
-                break
-
-        return border if border >= min_size else 0
-
-    def _detect_border_by_corner_gpu(self, img: torch.Tensor, side: str, sensitivity: float, min_size: int, start_offset: int) -> int:
-        """Проход 2: проверка угла на GPU."""
-        h, w = img.shape[:2]
-        corner_size = min(self.MAX_CORNER_SIZE, h // self.CORNER_SIZE_RATIO, w // self.CORNER_SIZE_RATIO)
-
-        if side == 'top':
-            y_start = start_offset
-            corner = img[y_start:y_start+corner_size, 0:corner_size, :3]
-            get_line = lambda i: img[start_offset + i, :, :3]
-            max_scan = h // 2 - start_offset
-        elif side == 'bottom':
-            y_start = h - start_offset - corner_size
-            corner = img[max(0, y_start):h-start_offset, 0:corner_size, :3]
-            get_line = lambda i: img[h-1-start_offset-i, :, :3]
-            max_scan = h // 2 - start_offset
-        elif side == 'left':
-            x_start = start_offset
-            corner = img[0:corner_size, x_start:x_start+corner_size, :3]
-            get_line = lambda i: img[:, start_offset + i, :3]
-            max_scan = w // 2 - start_offset
-        else:
-            x_start = w - start_offset - corner_size
-            corner = img[0:corner_size, max(0, x_start):w-start_offset, :3]
-            get_line = lambda i: img[:, w-1-start_offset-i, :3]
-            max_scan = w // 2 - start_offset
-
-        if corner.numel() == 0 or max_scan <= 0:
-            return 0
-
-        ref_color = corner.reshape(-1, 3).float().median(dim=0).values
-
-        if not self._is_grayscale_color_gpu(ref_color):
-            return 0
-
-        extra_border = 0
-        for i in range(max_scan):
-            line = get_line(i).float()
-            line_median = line.median(dim=0).values
-
-            if self._is_grayscale_color_gpu(line_median):
-                diff = (line_median - ref_color).abs().mean().item()
-                if diff < sensitivity * self.SECOND_PASS_SENSITIVITY_MULTIPLIER:
-                    extra_border = i + 1
-                else:
-                    break
-            else:
-                break
-
-        total = start_offset + extra_border
-        return total if extra_border >= min_size else start_offset
 
 
 class SmartScreenshotCleaner:
