@@ -485,18 +485,27 @@ class SmartScreenshotCleaner:
                     boxes.append((x1, y1, x2, y2))
 
         if not boxes:
+            logger.info("No UI elements detected, returning original")
             return (image[0:1], torch.zeros(1, h, w))
 
-        logger.info(f"UI elements: {len(boxes)}")
+        logger.info(f"UI elements detected: {len(boxes)}")
 
         ui_mask = np.zeros((h, w), dtype=np.float32)
         processed = img_uint8.copy()
 
         for x1, y1, x2, y2 in boxes:
+            # Пропускаем слишком большие боксы (> 30% картинки) — это не UI элемент
+            box_area = (x2 - x1) * (y2 - y1)
+            img_area = h * w
+            if box_area > img_area * 0.3:
+                logger.info(f"Skipping large box {x1},{y1}-{x2},{y2}: {box_area/img_area*100:.1f}% of image")
+                continue
+
             ui_mask[y1:y2, x1:x2] = 1.0
             if self._is_uniform_background(img_uint8, x1, y1, x2, y2):
                 color = self._get_surrounding_color(img_uint8, x1, y1, x2, y2)
                 processed[y1:y2, x1:x2] = color
+                logger.info(f"Filled UI box {x1},{y1}-{x2},{y2} with color {color}")
 
         out_img = torch.from_numpy(processed.astype(np.float32) / 255.0).unsqueeze(0)
         out_mask = torch.from_numpy(ui_mask).unsqueeze(0)
