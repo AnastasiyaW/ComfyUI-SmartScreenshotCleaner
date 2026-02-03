@@ -21,7 +21,9 @@ def get_device() -> torch.device:
 
 
 class AutoBorderCrop:
-    """Обрезает однотонные рамки с краёв изображения."""
+    """Обрезает однотонные чёрные/белые/серые рамки с краёв изображения."""
+
+    SAFE_MARGIN = 50  # Минимум пикселей от главного объекта
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -39,30 +41,85 @@ class AutoBorderCrop:
     CATEGORY = "image/preprocessing"
 
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
-        # Берём только первый кадр
         img = (image[0].cpu().numpy() * 255).astype(np.uint8)
         h, w = img.shape[:2]
+
+        # Находим bbox главного объекта (не чёрное/белое)
+        content_bbox = self._find_content_bbox(img)
+        logger.info(f"Content bbox: {content_bbox}")
 
         crop = {}
         for side in ['top', 'bottom', 'left', 'right']:
             crop[side] = self._detect_border(img, side, sensitivity, min_border_size)
 
-        if (h - crop['top'] - crop['bottom']) < h * 0.5 or (w - crop['left'] - crop['right']) < w * 0.5:
+        # Ограничиваем кроп чтобы не срезать контент (50px запас)
+        if content_bbox:
+            cy1, cy2, cx1, cx2 = content_bbox
+            max_top = max(0, cy1 - self.SAFE_MARGIN)
+            max_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
+            max_left = max(0, cx1 - self.SAFE_MARGIN)
+            max_right = max(0, w - cx2 - self.SAFE_MARGIN)
+
+            crop['top'] = min(crop['top'], max_top)
+            crop['bottom'] = min(crop['bottom'], max_bottom)
+            crop['left'] = min(crop['left'], max_left)
+            crop['right'] = min(crop['right'], max_right)
+
+        logger.info(f"Crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
+
+        # Проверка что осталось достаточно контента
+        if (h - crop['top'] - crop['bottom']) < h * 0.3 or (w - crop['left'] - crop['right']) < w * 0.3:
             return (image[0:1],)
 
         y1, y2 = crop['top'], h - crop['bottom'] if crop['bottom'] > 0 else h
         x1, x2 = crop['left'], w - crop['right'] if crop['right'] > 0 else w
 
+        if y1 >= y2 or x1 >= x2:
+            return (image[0:1],)
+
         return (image[0:1, y1:y2, x1:x2, :],)
 
-    def _is_grayscale_color(self, rgb: np.ndarray, saturation_threshold: float = 30.0) -> bool:
-        """Проверяет, является ли цвет оттенком серого (чёрный/белый/серый)."""
-        r, g, b = rgb[0], rgb[1], rgb[2]
-        max_val = max(r, g, b)
-        min_val = min(r, g, b)
+    def _find_content_bbox(self, img: np.ndarray) -> tuple:
+        """Находит bbox контента (не чёрное/белое/серое)."""
+        h, w = img.shape[:2]
 
-        # Насыщенность (разница между макс и мин каналами)
-        saturation = max_val - min_val
+        # Конвертируем в grayscale
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img
+
+        # Маска: не слишком тёмное и не слишком светлое
+        # Чёрное < 30, белое > 225
+        content_mask = ((gray > 30) & (gray < 225)).astype(np.uint8)
+
+        # Также проверяем насыщенность (цветное = контент)
+        if len(img.shape) == 3:
+            max_ch = np.max(img, axis=2)
+            min_ch = np.min(img, axis=2)
+            saturation = max_ch.astype(np.int16) - min_ch.astype(np.int16)
+            color_mask = (saturation > 20).astype(np.uint8)
+            content_mask = np.maximum(content_mask, color_mask)
+
+        # Морфология для удаления шума
+        kernel = np.ones((5, 5), np.uint8)
+        content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_OPEN, kernel)
+        content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Находим bbox контента
+        coords = np.where(content_mask > 0)
+        if len(coords[0]) == 0:
+            return None
+
+        y1, y2 = coords[0].min(), coords[0].max()
+        x1, x2 = coords[1].min(), coords[1].max()
+
+        return (y1, y2, x1, x2)
+
+    def _is_grayscale_color(self, rgb: np.ndarray, saturation_threshold: float = 30.0) -> bool:
+        """Проверяет, является ли цвет оттенком серого."""
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        saturation = max(r, g, b) - min(r, g, b)
         return saturation < saturation_threshold
 
     def _detect_border(self, img, side, sensitivity, min_size):
@@ -81,16 +138,15 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w-1-i, :3]
             max_scan = w // 2
 
-        # Берём угловой сэмпл для определения цвета рамки
-        corner_size = min(50, h // 4, w // 4)
-        if side in ['top', 'bottom']:
-            corner = img[0:corner_size, 0:corner_size, :3] if side == 'top' else img[h-corner_size:h, 0:corner_size, :3]
-        else:
-            corner = img[0:corner_size, 0:corner_size, :3] if side == 'left' else img[0:corner_size, w-corner_size:w, :3]
+        # Берём первые несколько линий для определения цвета рамки
+        sample_lines = min(10, max_scan)
+        sample_pixels = []
+        for i in range(sample_lines):
+            sample_pixels.append(get_line(i))
+        sample = np.vstack(sample_pixels).astype(np.float32)
+        ref_color = np.median(sample, axis=0)
 
-        ref_color = np.median(corner.reshape(-1, 3).astype(np.float32), axis=0)
-
-        # Проверяем что это оттенок серого
+        # Проверяем что это оттенок серого (чёрный/белый/серый)
         if not self._is_grayscale_color(ref_color):
             return 0
 
@@ -99,13 +155,11 @@ class AutoBorderCrop:
             line = get_line(i).astype(np.float32)
             line_median = np.median(line, axis=0)
 
-            # Проверяем что линия похожа на рамку (серая и близка к ref)
+            # Проверяем что линия серая и близка к рамке
             if self._is_grayscale_color(line_median):
-                if np.abs(line_median - ref_color).mean() < sensitivity:
+                diff = np.abs(line_median - ref_color).mean()
+                if diff < sensitivity:
                     border = i + 1
-                elif np.std(line, axis=0).mean() > sensitivity * 3:
-                    # Линия неоднородная — конец рамки
-                    break
                 else:
                     break
             else:
@@ -120,7 +174,7 @@ class SmartScreenshotCleaner:
     Если ничего не найдено — пропускает без обработки.
     """
 
-    yolo_model = None  # Singleton
+    yolo_model = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -164,45 +218,42 @@ class SmartScreenshotCleaner:
             logger.error(f"YOLO error: {e}")
             return None
 
-    def _get_surrounding_color(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int, margin: int = 5) -> np.ndarray:
-        """Получает средний цвет пикселей вокруг области."""
+    def _get_surrounding_color(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int, margin: int = 10) -> np.ndarray:
+        """Получает цвет пикселей вокруг области. Если чёрное — чёрный, белое — белый."""
         h, w = img.shape[:2]
-
-        # Собираем пиксели вокруг бокса
         pixels = []
 
-        # Сверху
         if y1 > 0:
-            top = max(0, y1 - margin)
-            pixels.append(img[top:y1, x1:x2].reshape(-1, 3))
-
-        # Снизу
+            pixels.append(img[max(0, y1-margin):y1, x1:x2].reshape(-1, 3))
         if y2 < h:
-            bottom = min(h, y2 + margin)
-            pixels.append(img[y2:bottom, x1:x2].reshape(-1, 3))
-
-        # Слева
+            pixels.append(img[y2:min(h, y2+margin), x1:x2].reshape(-1, 3))
         if x1 > 0:
-            left = max(0, x1 - margin)
-            pixels.append(img[y1:y2, left:x1].reshape(-1, 3))
-
-        # Справа
+            pixels.append(img[y1:y2, max(0, x1-margin):x1].reshape(-1, 3))
         if x2 < w:
-            right = min(w, x2 + margin)
-            pixels.append(img[y1:y2, x2:right].reshape(-1, 3))
+            pixels.append(img[y1:y2, x2:min(w, x2+margin)].reshape(-1, 3))
 
-        if pixels:
-            all_pixels = np.concatenate(pixels, axis=0)
-            return np.median(all_pixels, axis=0).astype(np.uint8)
+        if not pixels:
+            return np.array([128, 128, 128], dtype=np.uint8)
 
-        return np.array([128, 128, 128], dtype=np.uint8)
+        all_pixels = np.concatenate(pixels, axis=0)
+        median_color = np.median(all_pixels, axis=0)
+
+        # Если почти чёрное (< 40) — делаем чисто чёрным
+        if median_color.mean() < 40:
+            return np.array([0, 0, 0], dtype=np.uint8)
+
+        # Если почти белое (> 215) — делаем чисто белым
+        if median_color.mean() > 215:
+            return np.array([255, 255, 255], dtype=np.uint8)
+
+        return median_color.astype(np.uint8)
 
     def _is_uniform_background(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int, threshold: float = 25.0) -> bool:
         """Проверяет однотонность фона вокруг области."""
         h, w = img.shape[:2]
         margin = 10
-
         pixels = []
+
         if y1 > margin:
             pixels.append(img[y1-margin:y1, x1:x2].reshape(-1, 3))
         if y2 < h - margin:
@@ -221,20 +272,15 @@ class SmartScreenshotCleaner:
 
     @torch.no_grad()
     def process(self, image: torch.Tensor, confidence: float = 0.2):
-        batch_size = image.shape[0]
         h, w = image.shape[1], image.shape[2]
 
         model = self._load_yolo()
-
-        # Если модель не загружена — возвращаем как есть
         if model is None:
-            return (image, torch.zeros(batch_size, h, w))
+            return (image[0:1], torch.zeros(1, h, w))
 
-        # Только первый кадр обрабатываем
         img = image[0].cpu().numpy()
         img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
-        # Детекция с уменьшенным размером для скорости
         results = model.predict(img_uint8, conf=confidence, verbose=False, device=self.device, imgsz=640)
 
         boxes = []
@@ -249,13 +295,11 @@ class SmartScreenshotCleaner:
                 if x2 > x1 and y2 > y1:
                     boxes.append((x1, y1, x2, y2))
 
-        # Если ничего не найдено — возвращаем как есть (быстро)
         if not boxes:
             return (image[0:1], torch.zeros(1, h, w))
 
         logger.info(f"UI elements: {len(boxes)}")
 
-        # Заливка
         ui_mask = np.zeros((h, w), dtype=np.float32)
         processed = img_uint8.copy()
 
