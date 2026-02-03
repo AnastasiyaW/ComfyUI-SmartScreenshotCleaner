@@ -916,15 +916,18 @@ class SmartScreenshotCleaner:
     _yolo_model = None
     _model_device = None
 
-    MAX_BOX_RATIO = 0.15  # Максимальный размер UI элемента (15% картинки)
+    # Константы класса
+    DEFAULT_CONFIDENCE = 0.1      # Низкий порог для лучшего распознавания UI
+    MAX_BOX_RATIO = 0.15          # Максимальный размер UI элемента (15% картинки)
     SURROUNDING_MARGIN = 10
+    BOX_EXPAND_PIXELS = 5         # Расширение маски вокруг UI элементов
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "confidence": ("FLOAT", {"default": 0.2, "min": 0.05, "max": 0.9, "step": 0.05}),
+                "confidence": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 0.9, "step": 0.01}),
             },
         }
 
@@ -1030,7 +1033,7 @@ class SmartScreenshotCleaner:
 
         # OmniParser YOLO для детекции UI элементов (иконки, кнопки и т.д.)
         if model is not None:
-            results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=640)
+            results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=1280)
             for result in results:
                 if result.boxes is None:
                     continue
@@ -1060,7 +1063,7 @@ class SmartScreenshotCleaner:
                 continue
 
             # Расширяем маску на несколько пикселей для лучшего инпейнтинга
-            expand = 5
+            expand = self.BOX_EXPAND_PIXELS
             y1_exp = max(0, y1 - expand)
             y2_exp = min(h, y2 + expand)
             x1_exp = max(0, x1 - expand)
