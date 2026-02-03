@@ -39,8 +39,7 @@ class AutoBorderCrop:
     CATEGORY = "image/preprocessing"
 
     def crop_borders(self, image: torch.Tensor, sensitivity: float = 15.0, min_border_size: int = 5):
-        # Для батча берём только первое изображение для определения кропа
-        # и применяем одинаковый кроп ко всем
+        # Берём только первый кадр
         img = (image[0].cpu().numpy() * 255).astype(np.uint8)
         h, w = img.shape[:2]
 
@@ -49,12 +48,12 @@ class AutoBorderCrop:
             crop[side] = self._detect_border(img, side, sensitivity, min_border_size)
 
         if (h - crop['top'] - crop['bottom']) < h * 0.5 or (w - crop['left'] - crop['right']) < w * 0.5:
-            return (image,)
+            return (image[0:1],)
 
         y1, y2 = crop['top'], h - crop['bottom'] if crop['bottom'] > 0 else h
         x1, x2 = crop['left'], w - crop['right'] if crop['right'] > 0 else w
 
-        return (image[:, y1:y2, x1:x2, :],)
+        return (image[0:1, y1:y2, x1:x2, :],)
 
     def _detect_border(self, img, side, sensitivity, min_size):
         h, w = img.shape[:2]
