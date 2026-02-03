@@ -207,14 +207,14 @@ class AutoBorderCrop:
             logger.warning(f"YOLO person detection failed: {e}")
             return None
 
-    def _analyze_line(self, line_pixels: torch.Tensor) -> Tuple[float, float]:
+    def _analyze_line(self, line_pixels: torch.Tensor) -> Tuple[float, float, float]:
         """Анализирует линию пикселей.
 
         Returns:
-            (saturation, std): насыщенность и динамика
+            (saturation, std, uniform_ratio): насыщенность, динамика, доля однотонных пикселей
         """
         if line_pixels.numel() == 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         pixels = line_pixels.reshape(-1, 3).float()
 
@@ -225,104 +225,101 @@ class AutoBorderCrop:
         # Динамика (STD) — разброс значений
         std = pixels.std().item()
 
-        return saturation, std
+        # Доля однотонных пикселей (серые, R≈G≈B)
+        # Пиксель однотонный если его насыщенность < 30
+        uniform_pixels = (sat_per_pixel < 30.0).float()
+        uniform_ratio = uniform_pixels.mean().item()
 
-    def _is_border_line(self, saturation: float, std: float) -> bool:
+        return saturation, std, uniform_ratio
+
+    def _is_border_line(self, saturation: float, std: float, uniform_ratio: float) -> bool:
         """Проверяет, является ли линия частью рамки.
 
-        Рамка = ОДНОТОННАЯ область (низкая STD).
-        Даже если есть небольшой цвет — если однотонно, это рамка!
+        Рамка если:
+        - >90% пикселей однотонные (серые/ч/б) — даже если есть немного цветного UI
+        - ИЛИ низкая динамика + низкая насыщенность
         """
-        # Главный критерий — однотонность (низкая динамика)
-        is_uniform = std < self.GRAY_MAX_STD
-        # Дополнительно: серый (R≈G≈B)
-        is_gray = saturation < self.GRAY_MAX_SATURATION
+        # Главный критерий: >90% линии — однотонные пиксели
+        if uniform_ratio >= 0.90:
+            return True
 
-        # Однотонный серый — 100% рамка
+        # Или классика: низкая динамика + серый
+        is_uniform = std < self.GRAY_MAX_STD
+        is_gray = saturation < self.GRAY_MAX_SATURATION
         if is_uniform and is_gray:
             return True
 
-        # Однотонный но с небольшим цветом — тоже рамка (напр. светло-голубой UI)
-        # Но только если очень однотонный (STD < 10)
+        # Очень однотонно (STD < 10) — тоже рамка
         if std < 10.0:
             return True
 
         return False
 
-    def _is_picture_line(self, saturation: float, std: float) -> bool:
-        """Проверяет, является ли линия частью картинки (цвет И/ИЛИ динамика)."""
-        has_color = saturation >= self.PICTURE_MIN_SATURATION
-        has_dynamics = std >= self.PICTURE_MIN_STD
+    def _is_picture_line(self, saturation: float, std: float, uniform_ratio: float) -> bool:
+        """Проверяет, является ли линия частью картинки.
 
-        # Картинка = есть динамика (разнообразие пикселей)
-        # ИЛИ есть цвет + не совсем однотонно
-        return has_dynamics or (has_color and std >= 10.0)
+        Картинка если:
+        - Много цветных пикселей (<70% однотонных)
+        - ИЛИ высокая динамика
+        """
+        # Много цветных пикселей — это картинка
+        if uniform_ratio < 0.70:
+            return True
+
+        # Высокая динамика — картинка
+        if std >= self.PICTURE_MIN_STD:
+            return True
+
+        return False
 
     def _scan_from_edge(self, img: torch.Tensor, side: str) -> Tuple[int, bool]:
         """Сканирует от края к центру, ищет границу рамки.
 
+        Логика: идём от края, пока >90% пикселей однотонные — это рамка.
+        Как только <70% однотонных — это картинка, СТОП.
+
         Returns:
             (border_size, found_picture):
             - border_size: сколько пикселей рамки можно обрезать
-            - found_picture: нашли ли явную границу картинки (цвет/динамика)
+            - found_picture: нашли ли явную границу картинки
         """
         h, w = img.shape[:2]
         line_w = self.SCAN_LINE_WIDTH
 
-        # Анализируем центральную часть линии (60%), исключая края с возможным UI
-        margin_ratio = 0.2  # 20% с каждого края исключаем
-
+        # Сканируем ВСЮ линию — uniform_ratio покажет долю рамки
         if side == 'top':
             max_scan = h // 2
-            x_start = int(w * margin_ratio)
-            x_end = int(w * (1 - margin_ratio))
-            get_line = lambda pos: img[pos:pos+line_w, x_start:x_end, :3]
+            get_line = lambda pos: img[pos:pos+line_w, :, :3]
         elif side == 'bottom':
             max_scan = h // 2
-            x_start = int(w * margin_ratio)
-            x_end = int(w * (1 - margin_ratio))
-            get_line = lambda pos: img[h-pos-line_w:h-pos, x_start:x_end, :3]
+            get_line = lambda pos: img[h-pos-line_w:h-pos, :, :3]
         elif side == 'left':
             max_scan = w // 2
-            y_start = int(h * margin_ratio)
-            y_end = int(h * (1 - margin_ratio))
-            get_line = lambda pos: img[y_start:y_end, pos:pos+line_w, :3]
+            get_line = lambda pos: img[:, pos:pos+line_w, :3]
         else:  # right
             max_scan = w // 2
-            y_start = int(h * margin_ratio)
-            y_end = int(h * (1 - margin_ratio))
-            get_line = lambda pos: img[y_start:y_end, w-pos-line_w:w-pos, :3]
+            get_line = lambda pos: img[:, w-pos-line_w:w-pos, :3]
 
         border_size = 0
         found_picture = False
-
-        # Сканируем по 1 пикселю для точности
-        uncertain_count = 0  # Счётчик неопределённых линий подряд
-        MAX_UNCERTAIN = 5    # Разрешаем до 5 неопределённых линий (артефакты сжатия)
 
         for pos in range(0, max_scan):
             line = get_line(pos)
             if line.numel() == 0:
                 break
 
-            saturation, std = self._analyze_line(line)
+            saturation, std, uniform_ratio = self._analyze_line(line)
 
-            # Это картинка? (динамика или цвет + не однотонно)
-            if self._is_picture_line(saturation, std):
-                logger.info(f"{side}: PICTURE at {pos}px (sat={saturation:.1f}, std={std:.1f})")
+            # Это картинка? (<70% однотонных пикселей)
+            if self._is_picture_line(saturation, std, uniform_ratio):
+                logger.info(f"{side}: PICTURE at {pos}px (sat={saturation:.1f}, std={std:.1f}, uniform={uniform_ratio:.0%})")
                 found_picture = True
                 break
 
-            # Это рамка? (однотонная область)
-            if self._is_border_line(saturation, std):
+            # Это рамка? (>90% однотонных)
+            if self._is_border_line(saturation, std, uniform_ratio):
                 border_size = pos + 1
-                uncertain_count = 0  # Сбрасываем счётчик
-            else:
-                # Неопределённая зона — считаем
-                uncertain_count += 1
-                if uncertain_count >= MAX_UNCERTAIN:
-                    logger.info(f"{side}: too many uncertain lines at {pos}px, stop")
-                    break
+            # Промежуточная зона (70-90%) — продолжаем, но не увеличиваем border
 
         return (border_size if border_size >= self.MIN_BORDER_TO_CUT else 0, found_picture)
 
@@ -357,16 +354,16 @@ class AutoBorderCrop:
         if area.numel() == 0:
             return False
 
-        saturation, std = self._analyze_line(area)
+        saturation, std, uniform_ratio = self._analyze_line(area)
 
         # Если вокруг человека картинка — нельзя применять safe margin
-        if self._is_picture_line(saturation, std):
-            logger.info(f"{side}: PICTURE around person (sat={saturation:.1f}, std={std:.1f}) — no safe margin")
+        if self._is_picture_line(saturation, std, uniform_ratio):
+            logger.info(f"{side}: PICTURE around person (uniform={uniform_ratio:.0%}) — no safe margin")
             return False
 
         # Если вокруг человека рамка — можно применить safe margin
-        if self._is_border_line(saturation, std):
-            logger.info(f"{side}: BORDER around person (sat={saturation:.1f}, std={std:.1f}) — apply safe margin")
+        if self._is_border_line(saturation, std, uniform_ratio):
+            logger.info(f"{side}: BORDER around person (uniform={uniform_ratio:.0%}) — apply safe margin")
             return True
 
         # Неопределённо — лучше не резать
