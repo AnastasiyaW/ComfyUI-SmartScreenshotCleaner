@@ -269,18 +269,29 @@ class AutoBorderCrop:
         h, w = img.shape[:2]
         line_w = self.SCAN_LINE_WIDTH
 
+        # Анализируем центральную часть линии (60%), исключая края с возможным UI
+        margin_ratio = 0.2  # 20% с каждого края исключаем
+
         if side == 'top':
             max_scan = h // 2
-            get_line = lambda pos: img[pos:pos+line_w, :, :3]
+            x_start = int(w * margin_ratio)
+            x_end = int(w * (1 - margin_ratio))
+            get_line = lambda pos: img[pos:pos+line_w, x_start:x_end, :3]
         elif side == 'bottom':
             max_scan = h // 2
-            get_line = lambda pos: img[h-pos-line_w:h-pos, :, :3]
+            x_start = int(w * margin_ratio)
+            x_end = int(w * (1 - margin_ratio))
+            get_line = lambda pos: img[h-pos-line_w:h-pos, x_start:x_end, :3]
         elif side == 'left':
             max_scan = w // 2
-            get_line = lambda pos: img[:, pos:pos+line_w, :3]
+            y_start = int(h * margin_ratio)
+            y_end = int(h * (1 - margin_ratio))
+            get_line = lambda pos: img[y_start:y_end, pos:pos+line_w, :3]
         else:  # right
             max_scan = w // 2
-            get_line = lambda pos: img[:, w-pos-line_w:w-pos, :3]
+            y_start = int(h * margin_ratio)
+            y_end = int(h * (1 - margin_ratio))
+            get_line = lambda pos: img[y_start:y_end, w-pos-line_w:w-pos, :3]
 
         border_size = 0
         found_picture = False
