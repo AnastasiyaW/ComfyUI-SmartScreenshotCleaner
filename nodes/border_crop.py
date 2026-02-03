@@ -81,25 +81,31 @@ class AutoBorderCrop:
             get_line = lambda i: img[:, w-1-i, :3]
             max_scan = w // 2
 
-        ref_color = np.median(get_line(0).astype(np.float32), axis=0)
+        # Берём угловой сэмпл для определения цвета рамки
+        corner_size = min(50, h // 4, w // 4)
+        if side in ['top', 'bottom']:
+            corner = img[0:corner_size, 0:corner_size, :3] if side == 'top' else img[h-corner_size:h, 0:corner_size, :3]
+        else:
+            corner = img[0:corner_size, 0:corner_size, :3] if side == 'left' else img[0:corner_size, w-corner_size:w, :3]
 
-        # Проверяем что первая линия однородная
-        if np.std(get_line(0), axis=0).mean() > sensitivity * 2:
-            return 0
+        ref_color = np.median(corner.reshape(-1, 3).astype(np.float32), axis=0)
 
-        # Проверяем что это оттенок серого (чёрный/белый/серый), а не цветной
+        # Проверяем что это оттенок серого
         if not self._is_grayscale_color(ref_color):
             return 0
 
         border = 0
         for i in range(max_scan):
             line = get_line(i).astype(np.float32)
-            line_color = np.mean(line, axis=0)
+            line_median = np.median(line, axis=0)
 
-            # Проверяем однородность и что цвет остаётся серым
-            if np.abs(line_color - ref_color).mean() < sensitivity:
-                if self._is_grayscale_color(line_color):
+            # Проверяем что линия похожа на рамку (серая и близка к ref)
+            if self._is_grayscale_color(line_median):
+                if np.abs(line_median - ref_color).mean() < sensitivity:
                     border = i + 1
+                elif np.std(line, axis=0).mean() > sensitivity * 3:
+                    # Линия неоднородная — конец рамки
+                    break
                 else:
                     break
             else:
