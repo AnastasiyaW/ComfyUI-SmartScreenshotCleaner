@@ -203,6 +203,149 @@ class AutoBorderCrop:
             logger.warning(f"YOLO person detection failed: {e}")
             return None
 
+    def _find_sharp_content_edge(self, img: torch.Tensor, side: str, search_start: int, search_end: int) -> Tuple[Optional[int], Optional[int]]:
+        """Ищет чёткую границу контента (резкий переход от фона к контенту по всей длине линии).
+
+        Возвращает (sharp_edge, ambiguous_start):
+        - sharp_edge: позиция чёткой границы или None
+        - ambiguous_start: начало неоднозначной зоны (для LaMa) или None
+
+        Логика:
+        1. Чёткая граница = резкий скачок динамики пикселей по всей длине линии
+        2. Неоднозначная зона = переход (тень, градиент) между фоном и контентом
+        3. Если за неоднозначной зоной есть реальный объект — не режем, а LaMa заливает тень
+        """
+        h, w = img.shape[:2]
+
+        if search_start >= search_end:
+            return None, None
+
+        # Определяем направление сканирования
+        if side == 'top':
+            get_line = lambda i: img[i, :, :3]
+            max_pos = h
+        elif side == 'bottom':
+            get_line = lambda i: img[h - 1 - i, :, :3]
+            max_pos = h
+        elif side == 'left':
+            get_line = lambda i: img[:, i, :3]
+            max_pos = w
+        else:  # right
+            get_line = lambda i: img[:, w - 1 - i, :3]
+            max_pos = w
+
+        # Пороги
+        EDGE_DYNAMICS_THRESHOLD = 50.0  # std для контента
+        AMBIGUOUS_THRESHOLD_LOW = 15.0   # ниже — чистый фон
+        AMBIGUOUS_THRESHOLD_HIGH = 40.0  # выше — контент
+        MIN_COVERAGE = 0.7
+        LOOKAHEAD_PIXELS = 30  # смотрим вперёд чтобы найти объект за тенью
+
+        prev_is_uniform = True
+        ambiguous_start = None
+        in_ambiguous_zone = False
+
+        for pos in range(search_start, min(search_end, max_pos)):
+            line = get_line(pos).float()
+            line_std = line.std(dim=0).mean().item()
+
+            # Проверяем яркость — чёрный/белый фон?
+            line_mean = line.mean().item()
+            is_bw_background = line_mean < 30 or line_mean > 225
+
+            # Проверяем покрытие динамикой
+            num_segments = 10
+            if side in ('top', 'bottom'):
+                segment_size = max(1, w // num_segments)
+                segments_dynamic = 0
+                for seg in range(num_segments):
+                    seg_start = seg * segment_size
+                    seg_end = min((seg + 1) * segment_size, w)
+                    seg_pixels = line[seg_start:seg_end]
+                    if seg_pixels.numel() > 0:
+                        seg_std = seg_pixels.std(dim=0).mean().item()
+                        if seg_std > 20:
+                            segments_dynamic += 1
+            else:
+                segment_size = max(1, h // num_segments)
+                segments_dynamic = 0
+                for seg in range(num_segments):
+                    seg_start = seg * segment_size
+                    seg_end = min((seg + 1) * segment_size, h)
+                    seg_pixels = line[seg_start:seg_end]
+                    if seg_pixels.numel() > 0:
+                        seg_std = seg_pixels.std(dim=0).mean().item()
+                        if seg_std > 20:
+                            segments_dynamic += 1
+
+            coverage = segments_dynamic / num_segments
+            is_content_line = line_std > EDGE_DYNAMICS_THRESHOLD and coverage > MIN_COVERAGE
+
+            # Неоднозначная зона: не чистый фон, но и не контент (тень, градиент)
+            is_ambiguous = (AMBIGUOUS_THRESHOLD_LOW < line_std < AMBIGUOUS_THRESHOLD_HIGH and
+                           not is_bw_background and coverage < MIN_COVERAGE)
+
+            # Запоминаем начало неоднозначной зоны
+            if is_ambiguous and ambiguous_start is None and prev_is_uniform:
+                ambiguous_start = pos
+                in_ambiguous_zone = True
+                logger.info(f"{side}: ambiguous zone (shadow/gradient) starts at {pos}, std={line_std:.1f}")
+
+            # Нашли резкий переход к контенту
+            if is_content_line:
+                if in_ambiguous_zone:
+                    # За тенью/градиентом есть реальный объект — это часть фото!
+                    # Проверяем что объект продолжается дальше (не случайный шум)
+                    content_continues = self._check_content_continues(img, side, pos, LOOKAHEAD_PIXELS)
+                    if content_continues:
+                        # Реальный объект за тенью — не режем! LaMa заполнит тень
+                        logger.info(f"{side}: content found after shadow at {pos}, keeping object, LaMa will fill shadow")
+                        return None, ambiguous_start
+                    else:
+                        # Случайный шум — режем до начала неоднозначной зоны
+                        logger.info(f"{side}: found sharp edge at {pos} after ambiguous zone")
+                        return pos, ambiguous_start
+                elif prev_is_uniform:
+                    # Чистый переход фон -> контент
+                    logger.info(f"{side}: found sharp edge at {pos}, std={line_std:.1f}, coverage={coverage:.1%}")
+                    return pos, None
+
+            prev_is_uniform = line_std < AMBIGUOUS_THRESHOLD_LOW
+            if not is_ambiguous:
+                in_ambiguous_zone = False
+
+        # Не нашли чёткую границу, но может быть неоднозначная зона
+        return None, ambiguous_start
+
+    def _check_content_continues(self, img: torch.Tensor, side: str, start_pos: int, lookahead: int) -> bool:
+        """Проверяет, продолжается ли контент дальше (не случайный шум).
+        Если контент стабильно высокой динамики на протяжении lookahead пикселей — это реальный объект.
+        """
+        h, w = img.shape[:2]
+
+        if side == 'top':
+            get_line = lambda i: img[i, :, :3] if i < h else None
+        elif side == 'bottom':
+            get_line = lambda i: img[h - 1 - i, :, :3] if i < h else None
+        elif side == 'left':
+            get_line = lambda i: img[:, i, :3] if i < w else None
+        else:
+            get_line = lambda i: img[:, w - 1 - i, :3] if i < w else None
+
+        content_lines = 0
+        for offset in range(lookahead):
+            line = get_line(start_pos + offset)
+            if line is None:
+                break
+            line_std = line.float().std(dim=0).mean().item()
+            if line_std > 40:  # динамика выше порога
+                content_lines += 1
+
+        # Если больше 60% линий имеют высокую динамику — это реальный объект
+        ratio = content_lines / max(1, lookahead)
+        logger.info(f"{side}: content check at {start_pos}, {content_lines}/{lookahead} lines = {ratio:.1%}")
+        return ratio > 0.6
+
     def _is_pure_border_color(self, img: torch.Tensor, side: str, depth: int = 30) -> Tuple[bool, Optional[torch.Tensor]]:
         """Проверяет, является ли край чисто чёрным/белым/серым.
         Возвращает (is_pure, color) где color - медианный цвет края."""
@@ -307,15 +450,32 @@ class AutoBorderCrop:
                     logger.info(f"{side}: has content at border {detected_border}, not cropping")
                     crop[side] = 0
                 elif final_bbox:
-                    # Ограничиваем обрезку safe margin от объекта
                     _, _, bx1, bx2 = final_bbox
                     if side == 'left':
                         safe_limit = max(0, bx1 - self.SAFE_MARGIN_HORIZONTAL)
-                        crop[side] = min(detected_border, safe_limit)
                     else:
                         safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
-                        crop[side] = min(detected_border, safe_limit)
-                    logger.info(f"{side}: pure border, crop={crop[side]} (safe_limit={safe_limit})")
+
+                    if detected_border > safe_limit:
+                        # Обрезка хочет зайти в safe space — ищем чёткую границу контента
+                        sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, side, safe_limit, detected_border)
+                        if sharp_edge is not None:
+                            # Нашли чёткую границу — режем до неё
+                            crop[side] = sharp_edge
+                            logger.info(f"{side}: found sharp edge at {sharp_edge}, cropping to it (was {detected_border})")
+                        elif ambiguous_start is not None:
+                            # Есть неоднозначная зона — режем до неё и помечаем для LaMa
+                            crop[side] = ambiguous_start
+                            need_lama = True
+                            logger.info(f"{side}: ambiguous zone at {ambiguous_start}, crop there + LaMa")
+                        else:
+                            # Нет чёткой границы — останавливаемся на safe limit
+                            crop[side] = safe_limit
+                            logger.info(f"{side}: no sharp edge in safe zone, crop={safe_limit} (wanted {detected_border})")
+                    else:
+                        # Обрезка не заходит в safe space — просто режем
+                        crop[side] = detected_border
+                        logger.info(f"{side}: pure border, crop={crop[side]} (within safe limit)")
                 else:
                     crop[side] = detected_border
             else:
@@ -338,7 +498,19 @@ class AutoBorderCrop:
             safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
             if top_border > safe_top:
-                if top_type == 'uniform':
+                # Сначала ищем чёткую границу контента в safe zone
+                sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'top', safe_top, top_border)
+
+                if sharp_edge is not None:
+                    # Нашли чёткую границу — режем до неё без дополнительной обработки
+                    crop['top'] = sharp_edge
+                    logger.info(f"Top: found sharp edge at {sharp_edge}, cropping to it")
+                elif ambiguous_start is not None:
+                    # Неоднозначная зона — режем до неё и заливаем LaMa
+                    crop['top'] = ambiguous_start
+                    need_lama = True
+                    logger.info(f"Top: ambiguous zone at {ambiguous_start}, crop there + LaMa")
+                elif top_type == 'uniform':
                     fill_color = self._get_border_color_gpu(img_gpu, 'top')
                     img_gpu[safe_top:top_border, :, :3] = fill_color
                     crop['top'] = top_border
@@ -349,12 +521,24 @@ class AutoBorderCrop:
                 else:
                     need_lama = True
                     crop['top'] = safe_top
-                    logger.info(f"Top: mixed, crop to safe={safe_top}, LaMa needed")
+                    logger.info(f"Top: mixed, no sharp edge, crop to safe={safe_top}, LaMa needed")
             else:
                 crop['top'] = top_border
 
             if bottom_border > safe_bottom:
-                if bottom_type == 'uniform':
+                # Сначала ищем чёткую границу контента в safe zone
+                sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'bottom', safe_bottom, bottom_border)
+
+                if sharp_edge is not None:
+                    # Нашли чёткую границу — режем до неё
+                    crop['bottom'] = sharp_edge
+                    logger.info(f"Bottom: found sharp edge at {sharp_edge}, cropping to it")
+                elif ambiguous_start is not None:
+                    # Неоднозначная зона — режем до неё и заливаем LaMa
+                    crop['bottom'] = ambiguous_start
+                    need_lama = True
+                    logger.info(f"Bottom: ambiguous zone at {ambiguous_start}, crop there + LaMa")
+                elif bottom_type == 'uniform':
                     fill_color = self._get_border_color_gpu(img_gpu, 'bottom')
                     img_gpu[h-bottom_border:h-safe_bottom, :, :3] = fill_color
                     crop['bottom'] = bottom_border
@@ -610,24 +794,15 @@ class AutoBorderCrop:
 
 class SmartScreenshotCleaner:
     """
-    Находит UI элементы и заливает их РЕАЛЬНЫМ цветом окружения.
-    Комбинирует YOLO детекцию + детекцию ярких мелких элементов (точки, иконки).
-    Полностью GPU-ускоренная версия.
+    Находит UI элементы через YOLO модели и удаляет их через LaMa инпейнтинг.
+    Использует OmniParser для детекции UI элементов.
     """
 
     _yolo_model = None
     _model_device = None
 
-    MAX_BOX_RATIO = 0.1
-    UNIFORM_BACKGROUND_THRESHOLD = 25.0
+    MAX_BOX_RATIO = 0.15  # Максимальный размер UI элемента (15% картинки)
     SURROUNDING_MARGIN = 10
-
-    # Параметры для детекции ярких UI элементов (жёлтые точки, иконки и т.д.)
-    BRIGHT_YELLOW_MIN = (180, 160, 0)    # Минимальный RGB для жёлтого (расширено)
-    BRIGHT_YELLOW_MAX = (255, 255, 120)  # Максимальный RGB для жёлтого
-    MIN_BLOB_SIZE = 3                     # Минимальный размер элемента в пикселях
-    MAX_BLOB_SIZE = 150                   # Максимальный размер (не UI если больше)
-    BLOB_EXPAND_MARGIN = 5                # Расширение области вокруг найденного блоба
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -698,160 +873,6 @@ class SmartScreenshotCleaner:
             logger.error(f"YOLO error: {e}")
             return None
 
-    def _is_uniform_background_gpu(self, img: torch.Tensor, x1: int, y1: int, x2: int, y2: int) -> bool:
-        """Проверяет однотонность фона вокруг области на GPU."""
-        h, w = img.shape[:2]
-        margin = self.SURROUNDING_MARGIN
-        pixels = []
-
-        if y1 > margin:
-            pixels.append(img[y1-margin:y1, x1:x2, :3].reshape(-1, 3))
-        if y2 < h - margin:
-            pixels.append(img[y2:y2+margin, x1:x2, :3].reshape(-1, 3))
-        if x1 > margin:
-            pixels.append(img[y1:y2, x1-margin:x1, :3].reshape(-1, 3))
-        if x2 < w - margin:
-            pixels.append(img[y1:y2, x2:x2+margin, :3].reshape(-1, 3))
-
-        if not pixels:
-            return False
-
-        all_pixels = torch.cat(pixels, dim=0).float()
-        std = all_pixels.std(dim=0).mean()
-        return std.item() < self.UNIFORM_BACKGROUND_THRESHOLD
-
-    def _detect_bright_ui_elements_gpu(self, img: torch.Tensor) -> torch.Tensor:
-        """Детектирует яркие UI элементы (жёлтые точки, иконки) на GPU.
-        Возвращает маску найденных элементов."""
-        h, w = img.shape[:2]
-        device = img.device
-
-        r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-
-        # Жёлтый: высокий R, высокий G, низкий B (индикаторы Instagram)
-        yellow_mask = (
-            (r > self.BRIGHT_YELLOW_MIN[0]) & (r < self.BRIGHT_YELLOW_MAX[0]) &
-            (g > self.BRIGHT_YELLOW_MIN[1]) & (g < self.BRIGHT_YELLOW_MAX[1]) &
-            (b > self.BRIGHT_YELLOW_MIN[2]) & (b < self.BRIGHT_YELLOW_MAX[2])
-        ).float()
-
-        # Белые элементы (иконки, текст)
-        white_mask = (
-            (r > 235) & (g > 235) & (b > 235)
-        ).float()
-
-        # Ярко-красные элементы (сердечки, уведомления)
-        red_mask = (
-            (r > 180) & (g < 80) & (b < 80)
-        ).float()
-
-        # Оранжевые элементы (некоторые UI)
-        orange_mask = (
-            (r > 200) & (g > 100) & (g < 180) & (b < 80)
-        ).float()
-
-        # Голубые/синие элементы (верификация, ссылки)
-        blue_mask = (
-            (r < 100) & (g > 150) & (b > 200)
-        ).float()
-
-        # Розовые/пурпурные (Instagram gradient icons)
-        pink_mask = (
-            (r > 180) & (g < 100) & (b > 150)
-        ).float()
-
-        # Объединяем все маски
-        combined_mask = yellow_mask
-        for mask in [white_mask, red_mask, orange_mask, blue_mask, pink_mask]:
-            combined_mask = torch.maximum(combined_mask, mask)
-
-        if combined_mask.sum() == 0:
-            return torch.zeros(h, w, device=device)
-
-        # Морфология: расширяем найденные области
-        mask_4d = combined_mask.unsqueeze(0).unsqueeze(0)
-        # Dilate чтобы объединить близкие пиксели
-        dilated = F.max_pool2d(mask_4d, kernel_size=7, stride=1, padding=3)
-        # Erode чтобы убрать шум
-        eroded = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
-
-        return eroded.squeeze(0).squeeze(0)
-
-    def _detect_ui_with_yolo_person(self, img_np: np.ndarray, device: torch.device) -> List[Tuple[int, int, int, int]]:
-        """Детектирует НЕ-человеческие объекты через YOLOv11 как потенциальные UI."""
-        try:
-            model = _load_yolo_model("yolo_person", device)
-            if model is None:
-                return []
-
-            h, w = img_np.shape[:2]
-
-            # Детектируем ВСЕ объекты, потом исключим людей
-            results = model.predict(img_np, conf=0.25, verbose=False, device=device, imgsz=640)
-
-            boxes = []
-            for result in results:
-                if result.boxes is None:
-                    continue
-                for i in range(len(result.boxes)):
-                    cls = int(result.boxes.cls[i].item())
-                    # Пропускаем людей (class 0) и большие объекты
-                    if cls == 0:
-                        continue
-
-                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = box
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-
-                    # Только мелкие объекты — это UI
-                    area = (x2 - x1) * (y2 - y1)
-                    if area < (h * w * 0.05) and x2 > x1 and y2 > y1:
-                        boxes.append((x1, y1, x2, y2))
-
-            logger.info(f"YOLOv11 detected {len(boxes)} non-person small objects")
-            return boxes
-
-        except Exception as e:
-            logger.warning(f"YOLOv11 detection failed: {e}")
-            return []
-
-    def _find_connected_components_gpu(self, mask: torch.Tensor, min_size: int, max_size: int) -> List[Tuple[int, int, int, int]]:
-        """Находит связные компоненты в маске и возвращает их bbox'ы.
-        Фильтрует по размеру."""
-        if mask.sum() == 0:
-            return []
-
-        # Переносим на CPU для поиска компонент (GPU версия сложнее)
-        mask_np = (mask > 0.5).cpu().numpy().astype(np.uint8)
-
-        # Простой поиск через connected components
-        from scipy import ndimage
-        labeled, num_features = ndimage.label(mask_np)
-
-        boxes = []
-        for i in range(1, num_features + 1):
-            coords = np.where(labeled == i)
-            if len(coords[0]) == 0:
-                continue
-
-            y1, y2 = coords[0].min(), coords[0].max()
-            x1, x2 = coords[1].min(), coords[1].max()
-
-            area = (y2 - y1 + 1) * (x2 - x1 + 1)
-
-            if min_size <= area <= max_size * max_size:
-                # Расширяем bbox
-                margin = self.BLOB_EXPAND_MARGIN
-                h, w = mask_np.shape
-                y1 = max(0, y1 - margin)
-                y2 = min(h, y2 + margin)
-                x1 = max(0, x1 - margin)
-                x2 = min(w, x2 + margin)
-                boxes.append((x1, y1, x2, y2))
-
-        return boxes
-
     @torch.no_grad()
     def process(self, image: torch.Tensor, confidence: float = 0.2):
         if image.shape[0] == 0:
@@ -881,7 +902,7 @@ class SmartScreenshotCleaner:
 
     def _process_single_image(self, img: torch.Tensor, model, confidence: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """Обрабатывает одно изображение на GPU.
-        Комбинирует 3 метода детекции: OmniParser + YOLOv11 + цветовая детекция."""
+        Использует OmniParser YOLO для детекции UI элементов и LaMa для инпейнтинга."""
         device = self.device
         h, w = img.shape[:2]
 
@@ -892,7 +913,7 @@ class SmartScreenshotCleaner:
 
         all_boxes: List[Tuple[int, int, int, int]] = []
 
-        # 1. OmniParser YOLO (для десктопных UI элементов)
+        # OmniParser YOLO для детекции UI элементов (иконки, кнопки и т.д.)
         if model is not None:
             results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=640)
             for result in results:
@@ -907,25 +928,11 @@ class SmartScreenshotCleaner:
                         all_boxes.append((x1, y1, x2, y2))
             logger.info(f"OmniParser detected: {len(all_boxes)} UI elements")
 
-        # 2. YOLOv11 — детектируем мелкие не-человеческие объекты как UI
-        yolo_boxes = self._detect_ui_with_yolo_person(img_np, device)
-        all_boxes.extend(yolo_boxes)
-
-        # 3. Цветовая детекция ярких UI элементов (жёлтые точки, иконки и т.д.)
-        bright_mask = self._detect_bright_ui_elements_gpu(img_uint8_gpu.float())
-        bright_boxes = self._find_connected_components_gpu(
-            bright_mask,
-            min_size=self.MIN_BLOB_SIZE,
-            max_size=self.MAX_BLOB_SIZE
-        )
-        logger.info(f"Color detected: {len(bright_boxes)} bright UI elements")
-        all_boxes.extend(bright_boxes)
-
         if not all_boxes:
             logger.info("No UI elements detected, returning original")
             return img, torch.zeros(h, w, device=device)
 
-        logger.info(f"Total UI elements: {len(all_boxes)}")
+        logger.info(f"Total UI elements to remove: {len(all_boxes)}")
 
         # Создаём маску для всех UI элементов
         ui_mask = torch.zeros(h, w, device=device, dtype=torch.float32)
