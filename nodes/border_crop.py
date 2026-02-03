@@ -44,9 +44,13 @@ class AutoBorderCrop:
         img = (image[0].cpu().numpy() * 255).astype(np.uint8)
         h, w = img.shape[:2]
 
-        # Находим bbox главного объекта (не чёрное/белое)
+        # Находим bbox главного объекта
         content_bbox = self._find_content_bbox(img)
         logger.info(f"Content bbox: {content_bbox}")
+
+        # Определяем тип краёв изображения
+        edge_type = self._analyze_edges(img)
+        logger.info(f"Edge type: {edge_type}")
 
         crop = {}
         for side in ['top', 'bottom', 'left', 'right']:
@@ -54,27 +58,44 @@ class AutoBorderCrop:
 
         logger.info(f"Detected borders: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
-        # Ограничиваем кроп чтобы не срезать контент (50px запас от главного объекта)
-        if content_bbox:
-            cy1, cy2, cx1, cx2 = content_bbox
-            max_top = max(0, cy1 - self.SAFE_MARGIN)
-            max_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
-            max_left = max(0, cx1 - self.SAFE_MARGIN)
-            max_right = max(0, w - cx2 - self.SAFE_MARGIN)
+        # Логика в зависимости от типа краёв
+        if edge_type == 'uniform':
+            # Однородный фон — сохраняем safe space
+            if content_bbox:
+                cy1, cy2, cx1, cx2 = content_bbox
+                max_top = max(0, cy1 - self.SAFE_MARGIN)
+                max_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
+                max_left = max(0, cx1 - self.SAFE_MARGIN)
+                max_right = max(0, w - cx2 - self.SAFE_MARGIN)
 
-            # Применяем ограничение — главный объект приоритет
-            if crop['top'] > max_top:
-                logger.info(f"Top crop limited: {crop['top']} -> {max_top} (content protection)")
-                crop['top'] = max_top
-            if crop['bottom'] > max_bottom:
-                logger.info(f"Bottom crop limited: {crop['bottom']} -> {max_bottom} (content protection)")
-                crop['bottom'] = max_bottom
-            if crop['left'] > max_left:
-                logger.info(f"Left crop limited: {crop['left']} -> {max_left} (content protection)")
-                crop['left'] = max_left
-            if crop['right'] > max_right:
-                logger.info(f"Right crop limited: {crop['right']} -> {max_right} (content protection)")
-                crop['right'] = max_right
+                if crop['top'] > max_top:
+                    logger.info(f"Top limited: {crop['top']} -> {max_top} (uniform bg, safe space)")
+                    crop['top'] = max_top
+                if crop['bottom'] > max_bottom:
+                    logger.info(f"Bottom limited: {crop['bottom']} -> {max_bottom} (uniform bg, safe space)")
+                    crop['bottom'] = max_bottom
+                if crop['left'] > max_left:
+                    crop['left'] = max_left
+                if crop['right'] > max_right:
+                    crop['right'] = max_right
+
+        elif edge_type == 'dynamic':
+            # Динамичные края (фото) — срезаем без safe space
+            logger.info("Dynamic edges - cropping without safe space protection")
+            # crop остаётся как есть
+
+        else:  # 'mixed' — спорный случай
+            # Пробуем LaMa для заливки проблемных зон
+            logger.info("Mixed edges - will use LaMa for problematic areas")
+            img = self._fill_borders_with_lama(img, crop, content_bbox)
+
+            # После LaMa применяем safe space
+            if content_bbox:
+                cy1, cy2, cx1, cx2 = content_bbox
+                max_top = max(0, cy1 - self.SAFE_MARGIN)
+                max_bottom = max(0, h - cy2 - self.SAFE_MARGIN)
+                crop['top'] = min(crop['top'], max_top)
+                crop['bottom'] = min(crop['bottom'], max_bottom)
 
         logger.info(f"Final crop: top={crop['top']}, bottom={crop['bottom']}, left={crop['left']}, right={crop['right']}")
 
@@ -88,7 +109,92 @@ class AutoBorderCrop:
         if y1 >= y2 or x1 >= x2:
             return (image[0:1],)
 
+        # Если был LaMa — возвращаем обработанное изображение
+        if edge_type == 'mixed':
+            result = torch.from_numpy(img[y1:y2, x1:x2, :].astype(np.float32) / 255.0).unsqueeze(0)
+            return (result,)
+
         return (image[0:1, y1:y2, x1:x2, :],)
+
+    def _analyze_edges(self, img: np.ndarray) -> str:
+        """Анализирует края изображения: uniform, dynamic, mixed."""
+        h, w = img.shape[:2]
+        edge_size = 30
+
+        # Берём полосы с краёв
+        top_strip = img[0:edge_size, :, :3]
+        bottom_strip = img[h-edge_size:h, :, :3]
+        left_strip = img[:, 0:edge_size, :3]
+        right_strip = img[:, w-edge_size:w, :3]
+
+        def analyze_strip(strip):
+            pixels = strip.reshape(-1, 3).astype(np.float32)
+            std = np.std(pixels, axis=0).mean()
+            median = np.median(pixels, axis=0)
+
+            # Проверяем насыщенность (серое vs цветное)
+            saturation = max(median) - min(median)
+
+            if std < 15 and saturation < 30:
+                return 'uniform'  # Однородный серый/чёрный/белый
+            elif std > 40:
+                return 'dynamic'  # Много вариаций — фото
+            else:
+                return 'mixed'
+
+        results = [
+            analyze_strip(top_strip),
+            analyze_strip(bottom_strip),
+            analyze_strip(left_strip),
+            analyze_strip(right_strip)
+        ]
+
+        # Определяем общий тип
+        if all(r == 'uniform' for r in results):
+            return 'uniform'
+        elif all(r == 'dynamic' for r in results):
+            return 'dynamic'
+        elif results.count('dynamic') >= 2:
+            return 'dynamic'
+        else:
+            return 'mixed'
+
+    def _fill_borders_with_lama(self, img: np.ndarray, crop: dict, content_bbox: tuple) -> np.ndarray:
+        """Заливает проблемные области LaMa."""
+        try:
+            from simple_lama_inpainting import SimpleLama
+            from PIL import Image
+
+            h, w = img.shape[:2]
+            mask = np.zeros((h, w), dtype=np.uint8)
+
+            if content_bbox:
+                cy1, cy2, cx1, cx2 = content_bbox
+
+                # Маска для областей между рамкой и контентом
+                # Сверху: от конца рамки до начала safe zone
+                if crop['top'] > 0 and cy1 > crop['top']:
+                    safe_top = max(0, cy1 - self.SAFE_MARGIN)
+                    if safe_top > crop['top']:
+                        mask[crop['top']:safe_top, :] = 255
+
+                # Снизу
+                if crop['bottom'] > 0 and (h - cy2) > crop['bottom']:
+                    safe_bottom = min(h, cy2 + self.SAFE_MARGIN)
+                    if safe_bottom < h - crop['bottom']:
+                        mask[safe_bottom:h-crop['bottom'], :] = 255
+
+            if mask.max() == 0:
+                return img
+
+            logger.info("Applying LaMa inpainting for border areas")
+            lama = SimpleLama()
+            result = lama(Image.fromarray(img), Image.fromarray(mask))
+            return np.array(result)
+
+        except Exception as e:
+            logger.warning(f"LaMa failed: {e}, using original")
+            return img
 
     def _find_content_bbox(self, img: np.ndarray) -> tuple:
         """Находит bbox контента (не чёрное/белое/серое)."""

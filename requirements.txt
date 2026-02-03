@@ -2,7 +2,11 @@
 torch>=2.0.0
 numpy>=1.21.0
 opencv-python>=4.5.0
+Pillow>=9.0.0
 
 # YOLO UI Detection
 ultralytics>=8.0.0
 huggingface_hub>=0.16.0
+
+# LaMa Inpainting (for mixed edge cases)
+simple-lama-inpainting>=0.1.0
