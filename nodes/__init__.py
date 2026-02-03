@@ -1,3 +1,3 @@
-from .border_crop import AutoBorderCrop, SmartScreenshotCleaner
+from .border_crop import AutoBorderCrop, SmartScreenshotCleaner, ImageSwitch, MaskSwitch
 
-__all__ = ["AutoBorderCrop", "SmartScreenshotCleaner"]
+__all__ = ["AutoBorderCrop", "SmartScreenshotCleaner", "ImageSwitch", "MaskSwitch"]

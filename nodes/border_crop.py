@@ -1316,3 +1316,174 @@ class SmartScreenshotCleaner:
             processed = torch.where(mask_3d > 0.5, mean_color, processed)
 
         return (processed / 255.0).clamp(0, 1)
+
+
+class ImageSwitch:
+    """
+    Переключатель изображений: если первое изображение полностью белое/чёрное,
+    на выход идёт второе изображение. Иначе — первое.
+
+    Полезно для условной логики в workflow:
+    - Если обработка вернула пустой результат → использовать оригинал
+    - Если маска пустая → пропустить шаг
+    """
+
+    # Пороги для определения "пустого" изображения
+    BLACK_THRESHOLD = 5           # Среднее значение < 5 = чёрное
+    WHITE_THRESHOLD = 250         # Среднее значение > 250 = белое
+    UNIFORMITY_THRESHOLD = 3.0    # STD < 3 = однотонное
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_primary": ("IMAGE",),
+                "image_fallback": ("IMAGE",),
+            },
+            "optional": {
+                "check_uniform": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "BOOLEAN")
+    RETURN_NAMES = ("image", "used_fallback")
+    FUNCTION = "switch"
+    CATEGORY = "image/preprocessing"
+
+    def switch(self, image_primary: torch.Tensor, image_fallback: torch.Tensor, check_uniform: bool = True):
+        """
+        Проверяет первое изображение и возвращает:
+        - image_primary если оно НЕ пустое (не чисто белое/чёрное)
+        - image_fallback если image_primary пустое
+
+        Args:
+            image_primary: Основное изображение [B, H, W, C]
+            image_fallback: Запасное изображение [B, H, W, C]
+            check_uniform: Проверять ли однотонность (не только чёрное/белое)
+
+        Returns:
+            (image, used_fallback): Выбранное изображение и флаг использования fallback
+        """
+        batch_size = image_primary.shape[0]
+        results = []
+        used_fallback_flags = []
+
+        for i in range(batch_size):
+            img = image_primary[i]
+            is_empty = self._is_empty_image(img, check_uniform)
+
+            if is_empty:
+                # Используем fallback
+                if i < image_fallback.shape[0]:
+                    results.append(image_fallback[i])
+                else:
+                    results.append(image_fallback[0])  # Если батч не совпадает
+                used_fallback_flags.append(True)
+                logger.info(f"ImageSwitch: image {i} is empty, using fallback")
+            else:
+                results.append(img)
+                used_fallback_flags.append(False)
+
+        out_image = torch.stack(results)
+        # Возвращаем True если хотя бы один fallback использован
+        used_fallback = any(used_fallback_flags)
+
+        return (out_image, used_fallback)
+
+    def _is_empty_image(self, img: torch.Tensor, check_uniform: bool) -> bool:
+        """Проверяет, является ли изображение пустым (белым/чёрным/однотонным)."""
+        # Конвертируем в 0-255 для проверки
+        img_255 = (img.clamp(0, 1) * 255).float()
+
+        # Среднее значение
+        mean_val = img_255.mean().item()
+
+        # Проверка на чёрное
+        if mean_val < self.BLACK_THRESHOLD:
+            logger.debug(f"Image is black: mean={mean_val:.1f}")
+            return True
+
+        # Проверка на белое
+        if mean_val > self.WHITE_THRESHOLD:
+            logger.debug(f"Image is white: mean={mean_val:.1f}")
+            return True
+
+        # Проверка на однотонность (опционально)
+        if check_uniform:
+            std_val = img_255.std().item()
+            if std_val < self.UNIFORMITY_THRESHOLD:
+                logger.debug(f"Image is uniform: std={std_val:.1f}")
+                return True
+
+        return False
+
+
+class MaskSwitch:
+    """
+    Переключатель по маске: если маска пустая (вся чёрная),
+    на выход идёт fallback изображение.
+
+    Полезно когда UI детекция ничего не нашла.
+    """
+
+    MASK_THRESHOLD = 0.01  # Если сумма маски < 1% пикселей = пустая
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_primary": ("IMAGE",),
+                "image_fallback": ("IMAGE",),
+                "mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "BOOLEAN")
+    RETURN_NAMES = ("image", "used_fallback")
+    FUNCTION = "switch"
+    CATEGORY = "image/preprocessing"
+
+    def switch(self, image_primary: torch.Tensor, image_fallback: torch.Tensor, mask: torch.Tensor):
+        """
+        Проверяет маску и возвращает:
+        - image_primary если маска НЕ пустая
+        - image_fallback если маска пустая
+
+        Args:
+            image_primary: Основное изображение (обработанное)
+            image_fallback: Запасное изображение (оригинал)
+            mask: Маска детекции
+
+        Returns:
+            (image, used_fallback): Выбранное изображение и флаг
+        """
+        batch_size = image_primary.shape[0]
+        results = []
+        used_fallback_flags = []
+
+        for i in range(batch_size):
+            # Получаем маску для этого изображения
+            if len(mask.shape) == 3:
+                m = mask[i] if i < mask.shape[0] else mask[0]
+            else:
+                m = mask
+
+            # Проверяем пустая ли маска
+            mask_ratio = (m > 0.5).float().mean().item()
+            is_empty = mask_ratio < self.MASK_THRESHOLD
+
+            if is_empty:
+                if i < image_fallback.shape[0]:
+                    results.append(image_fallback[i])
+                else:
+                    results.append(image_fallback[0])
+                used_fallback_flags.append(True)
+                logger.info(f"MaskSwitch: mask {i} is empty ({mask_ratio:.2%}), using fallback")
+            else:
+                results.append(image_primary[i])
+                used_fallback_flags.append(False)
+
+        out_image = torch.stack(results)
+        used_fallback = any(used_fallback_flags)
+
+        return (out_image, used_fallback)
