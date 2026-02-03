@@ -913,14 +913,16 @@ class SmartScreenshotCleaner:
     Использует OmniParser для детекции UI элементов.
     """
 
-    _yolo_model = None
+    _models_cache = {}  # Кэш для всех моделей
     _model_device = None
 
     # Константы класса
     DEFAULT_CONFIDENCE = 0.1      # Низкий порог для лучшего распознавания UI
-    MAX_BOX_RATIO = 0.15          # Максимальный размер UI элемента (15% картинки)
+    MAX_BOX_RATIO = 0.20          # Максимальный размер UI элемента (20% картинки)
     SURROUNDING_MARGIN = 10
-    BOX_EXPAND_PIXELS = 5         # Расширение маски вокруг UI элементов
+    BOX_EXPAND_PIXELS = 10        # Расширение маски вокруг UI элементов
+    YOLO_IMGSZ = 1280             # Разрешение для YOLO
+    IOU_THRESHOLD = 0.5           # Порог IoU для дедупликации боксов
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -949,67 +951,159 @@ class SmartScreenshotCleaner:
         return d
 
     @classmethod
-    def unload_model(cls):
-        """Освобождает память GPU от модели YOLO."""
-        if cls._yolo_model is not None:
-            del cls._yolo_model
-            cls._yolo_model = None
-            cls._model_device = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            logger.info("YOLO model unloaded")
+    def unload_models(cls):
+        """Освобождает память GPU от всех моделей."""
+        for name, model in cls._models_cache.items():
+            del model
+            logger.info(f"Unloaded model: {name}")
+        cls._models_cache = {}
+        cls._model_device = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def _load_yolo(self):
+    def _load_model(self, model_name: str, repo_id: str, filename: str):
+        """Загружает модель из HuggingFace Hub с кэшированием."""
         current_device = self.device
+        cache_key = f"{model_name}_{current_device}"
 
-        if SmartScreenshotCleaner._yolo_model is not None:
-            if SmartScreenshotCleaner._model_device == current_device:
-                return SmartScreenshotCleaner._yolo_model
-            else:
-                self.unload_model()
+        if cache_key in SmartScreenshotCleaner._models_cache:
+            return SmartScreenshotCleaner._models_cache[cache_key]
 
         try:
             from ultralytics import YOLO
             from huggingface_hub import hf_hub_download
 
             path = hf_hub_download(
-                "microsoft/OmniParser-v2.0",
-                "icon_detect/model.pt",
+                repo_id,
+                filename,
                 cache_dir=self._get_models_dir()
             )
 
-            SmartScreenshotCleaner._yolo_model = YOLO(path)
-
+            model = YOLO(path)
             if current_device.type in ("cuda", "mps"):
-                SmartScreenshotCleaner._yolo_model.to(current_device)
+                model.to(current_device)
 
+            SmartScreenshotCleaner._models_cache[cache_key] = model
             SmartScreenshotCleaner._model_device = current_device
-            logger.info(f"YOLO loaded on {current_device}")
-            return SmartScreenshotCleaner._yolo_model
+            logger.info(f"Loaded {model_name} on {current_device}")
+            return model
 
         except Exception as e:
-            logger.error(f"YOLO error: {e}")
+            logger.error(f"Failed to load {model_name}: {e}")
             return None
 
+    def _load_all_models(self) -> List:
+        """Загружает все модели для детекции UI элементов.
+
+        Модели:
+        1. OmniParser icon_detect — UI элементы десктопа (иконки, кнопки, меню)
+        2. OmniParser icon_caption — текст и подписи в UI
+        3. YOLOv11n — быстрая универсальная модель
+        """
+        models = []
+
+        # 1. OmniParser icon_detect — основная модель для UI элементов
+        omni_icon = self._load_model(
+            "omniparser_icon",
+            "microsoft/OmniParser-v2.0",
+            "icon_detect/model.pt"
+        )
+        if omni_icon:
+            models.append(("omniparser_icon", omni_icon))
+
+        # 2. OmniParser icon_caption — детекция текста в UI
+        omni_caption = self._load_model(
+            "omniparser_caption",
+            "microsoft/OmniParser-v2.0",
+            "icon_caption/model.pt"
+        )
+        if omni_caption:
+            models.append(("omniparser_caption", omni_caption))
+
+        # 3. YOLOv11n — быстрая универсальная модель (автоскачивание)
+        try:
+            from ultralytics import YOLO
+            cache_key = f"yolo11n_{self.device}"
+            if cache_key not in SmartScreenshotCleaner._models_cache:
+                yolo11 = YOLO("yolo11n.pt")  # Автоскачивание
+                if self.device.type in ("cuda", "mps"):
+                    yolo11.to(self.device)
+                SmartScreenshotCleaner._models_cache[cache_key] = yolo11
+                logger.info(f"Loaded YOLOv11n on {self.device}")
+            models.append(("yolo11n", SmartScreenshotCleaner._models_cache[cache_key]))
+        except Exception as e:
+            logger.warning(f"YOLOv11n not loaded: {e}")
+
+        logger.info(f"Loaded {len(models)} detection models")
+        return models
+
+    def _deduplicate_boxes(self, boxes: List[Tuple[int, int, int, int]], iou_threshold: float = 0.5) -> List[Tuple[int, int, int, int]]:
+        """Удаляет дублирующиеся боксы по IoU (Intersection over Union)."""
+        if len(boxes) <= 1:
+            return boxes
+
+        # Сортируем по площади (большие сначала)
+        boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+        keep = []
+
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            box_area = (x2 - x1) * (y2 - y1)
+
+            should_keep = True
+            for kept_box in keep:
+                kx1, ky1, kx2, ky2 = kept_box
+
+                # Вычисляем пересечение
+                ix1 = max(x1, kx1)
+                iy1 = max(y1, ky1)
+                ix2 = min(x2, kx2)
+                iy2 = min(y2, ky2)
+
+                if ix1 < ix2 and iy1 < iy2:
+                    intersection = (ix2 - ix1) * (iy2 - iy1)
+                    kept_area = (kx2 - kx1) * (ky2 - ky1)
+                    union = box_area + kept_area - intersection
+                    iou = intersection / union if union > 0 else 0
+
+                    if iou > iou_threshold:
+                        should_keep = False
+                        break
+
+            if should_keep:
+                keep.append(box)
+
+        return keep
+
     @torch.no_grad()
-    def process(self, image: torch.Tensor, confidence: float = 0.2):
+    def process(self, image: torch.Tensor, confidence: float = 0.1):
+        """
+        Обрабатывает изображения: находит UI элементы и удаляет их через LaMa.
+
+        Использует несколько моделей:
+        1. OmniParser icon_detect — UI элементы (иконки, кнопки)
+        2. YOLOv8n — общие объекты (текст, мелкие элементы)
+        """
         if image.shape[0] == 0:
             return (image, torch.zeros(0, 1, 1, device=image.device))
 
         batch_size = image.shape[0]
         h, w = image.shape[1], image.shape[2]
 
-        model = self._load_yolo()
-        if model is None:
+        models = self._load_all_models()
+        if not models:
+            logger.warning("No models loaded, returning original image")
             empty_mask = torch.zeros(batch_size, h, w, device=image.device)
             return (image, empty_mask)
+
+        logger.info(f"Using {len(models)} models: {[m[0] for m in models]}")
 
         all_results = []
         all_masks = []
 
         for batch_idx in range(batch_size):
             single_img = image[batch_idx]
-            result_img, result_mask = self._process_single_image(single_img, model, confidence)
+            result_img, result_mask = self._process_single_image(single_img, models, confidence)
             all_results.append(result_img)
             all_masks.append(result_mask)
 
@@ -1018,9 +1112,9 @@ class SmartScreenshotCleaner:
 
         return (out_images, out_masks)
 
-    def _process_single_image(self, img: torch.Tensor, model, confidence: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _process_single_image(self, img: torch.Tensor, models: List, confidence: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """Обрабатывает одно изображение на GPU.
-        Использует OmniParser YOLO для детекции UI элементов и LaMa для инпейнтинга."""
+        Использует несколько YOLO моделей для детекции UI элементов и LaMa для инпейнтинга."""
         device = self.device
         h, w = img.shape[:2]
 
@@ -1031,26 +1125,52 @@ class SmartScreenshotCleaner:
 
         all_boxes: List[Tuple[int, int, int, int]] = []
 
-        # OmniParser YOLO для детекции UI элементов (иконки, кнопки и т.д.)
-        if model is not None:
-            results = model.predict(img_np, conf=confidence, verbose=False, device=device, imgsz=1280)
-            for result in results:
-                if result.boxes is None:
-                    continue
-                for i in range(len(result.boxes)):
-                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = box
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-                    if x2 > x1 and y2 > y1:
-                        all_boxes.append((x1, y1, x2, y2))
-            logger.info(f"OmniParser detected: {len(all_boxes)} UI elements")
+        # Прогоняем через все модели
+        for model_name, model in models:
+            if model is None:
+                continue
+
+            try:
+                # Для YOLOv11n фильтруем только UI-подобные классы
+                if model_name == "yolo11n":
+                    # COCO классы UI-подобных объектов:
+                    # tv(62), laptop(63), mouse(64), remote(65), keyboard(66), cell phone(67), book(73), clock(74)
+                    results = model.predict(
+                        img_np, conf=confidence * 0.5, verbose=False, device=device,
+                        imgsz=self.YOLO_IMGSZ, classes=[62, 63, 64, 65, 66, 67, 73, 74]
+                    )
+                else:
+                    # OmniParser — все классы с низким порогом
+                    results = model.predict(
+                        img_np, conf=confidence, verbose=False, device=device,
+                        imgsz=self.YOLO_IMGSZ
+                    )
+
+                model_boxes = 0
+                for result in results:
+                    if result.boxes is None:
+                        continue
+                    for i in range(len(result.boxes)):
+                        box = result.boxes.xyxy[i].cpu().numpy().astype(int)
+                        x1, y1, x2, y2 = box
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        if x2 > x1 and y2 > y1:
+                            all_boxes.append((x1, y1, x2, y2))
+                            model_boxes += 1
+
+                logger.info(f"{model_name} detected: {model_boxes} elements")
+
+            except Exception as e:
+                logger.warning(f"{model_name} failed: {e}")
 
         if not all_boxes:
             logger.info("No UI elements detected, returning original")
             return img, torch.zeros(h, w, device=device)
 
-        logger.info(f"Total UI elements to remove: {len(all_boxes)}")
+        # Дедупликация боксов (удаляем сильно перекрывающиеся)
+        all_boxes = self._deduplicate_boxes(all_boxes, iou_threshold=0.5)
+        logger.info(f"Total UI elements after dedup: {len(all_boxes)}")
 
         # Создаём маску для всех UI элементов
         ui_mask = torch.zeros(h, w, device=device, dtype=torch.float32)
