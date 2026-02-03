@@ -194,62 +194,50 @@ class SmartScreenshotCleaner:
     @torch.no_grad()
     def process(self, image: torch.Tensor, confidence: float = 0.2):
         batch_size = image.shape[0]
-        result_images = []
-        result_masks = []
+        h, w = image.shape[1], image.shape[2]
 
         model = self._load_yolo()
 
-        for b in range(batch_size):
-            img = image[b].cpu().numpy()
-            h, w = img.shape[:2]
-            img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        # Если модель не загружена — возвращаем как есть
+        if model is None:
+            return (image, torch.zeros(batch_size, h, w))
 
-            # Пустая маска
-            ui_mask = np.zeros((h, w), dtype=np.float32)
+        # Только первый кадр обрабатываем
+        img = image[0].cpu().numpy()
+        img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
-            # Если модель не загружена — пропускаем
-            if model is None:
-                result_images.append(image[b])
-                result_masks.append(torch.zeros(h, w))
+        # Детекция с уменьшенным размером для скорости
+        results = model.predict(img_uint8, conf=confidence, verbose=False, device=self.device, imgsz=640)
+
+        boxes = []
+        for result in results:
+            if result.boxes is None:
                 continue
+            for i in range(len(result.boxes)):
+                box = result.boxes.xyxy[i].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = box
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    boxes.append((x1, y1, x2, y2))
 
-            # Детекция
-            results = model.predict(img_uint8, conf=confidence, verbose=False, device=self.device)
+        # Если ничего не найдено — возвращаем как есть (быстро)
+        if not boxes:
+            return (image[0:1], torch.zeros(1, h, w))
 
-            boxes = []
-            for result in results:
-                if result.boxes is None:
-                    continue
-                for i in range(len(result.boxes)):
-                    box = result.boxes.xyxy[i].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = box
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-                    if x2 > x1 and y2 > y1:
-                        boxes.append((x1, y1, x2, y2))
+        logger.info(f"UI elements: {len(boxes)}")
 
-            # Если ничего не найдено — возвращаем оригинал
-            if not boxes:
-                result_images.append(image[b])
-                result_masks.append(torch.zeros(h, w))
-                continue
+        # Заливка
+        ui_mask = np.zeros((h, w), dtype=np.float32)
+        processed = img_uint8.copy()
 
-            logger.info(f"UI elements: {len(boxes)}")
+        for x1, y1, x2, y2 in boxes:
+            ui_mask[y1:y2, x1:x2] = 1.0
+            if self._is_uniform_background(img_uint8, x1, y1, x2, y2):
+                color = self._get_surrounding_color(img_uint8, x1, y1, x2, y2)
+                processed[y1:y2, x1:x2] = color
 
-            # Заливка каждого бокса
-            processed = img_uint8.copy()
-            for x1, y1, x2, y2 in boxes:
-                ui_mask[y1:y2, x1:x2] = 1.0
-
-                # Если фон однотонный — заливаем цветом (быстро)
-                if self._is_uniform_background(img_uint8, x1, y1, x2, y2):
-                    color = self._get_surrounding_color(img_uint8, x1, y1, x2, y2)
-                    processed[y1:y2, x1:x2] = color
-
-            result_images.append(torch.from_numpy(processed.astype(np.float32) / 255.0))
-            result_masks.append(torch.from_numpy(ui_mask))
-
-        out_img = torch.stack(result_images, dim=0)
-        out_mask = torch.stack(result_masks, dim=0)
+        out_img = torch.from_numpy(processed.astype(np.float32) / 255.0).unsqueeze(0)
+        out_mask = torch.from_numpy(ui_mask).unsqueeze(0)
 
         return (out_img, out_mask)
