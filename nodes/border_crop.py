@@ -498,16 +498,17 @@ class SmartScreenshotCleaner:
     _model_device = None
 
     # Константы класса
-    DEFAULT_CONFIDENCE = 0.1      # Низкий порог для лучшего распознавания UI
-    MAX_BOX_RATIO = 0.20          # Максимальный размер UI элемента (20% картинки)
+    DEFAULT_CONFIDENCE = 0.15     # Порог уверенности для UI элементов
+    MAX_BOX_RATIO = 0.05          # Максимальный размер UI элемента (5% картинки) — иконки маленькие!
+    MAX_BOX_SIDE = 150            # Максимальная сторона бокса в пикселях
     SURROUNDING_MARGIN = 10
-    BOX_EXPAND_PIXELS = 10        # Расширение маски вокруг UI элементов
+    BOX_EXPAND_PIXELS = 5         # Расширение маски вокруг UI элементов (уменьшено)
     YOLO_IMGSZ = 1280             # Разрешение для YOLO
     IOU_THRESHOLD = 0.5           # Порог IoU для дедупликации боксов
 
     # Зоны UI (доля изображения от края)
-    UI_EDGE_ZONE = 0.25           # 25% от края считается UI зоной
-    UI_CENTER_SAFE_ZONE = 0.4     # Центральные 40% защищены от детекции текста
+    UI_EDGE_ZONE = 0.20           # 20% от края считается UI зоной (уменьшено)
+    UI_CENTER_SAFE_ZONE = 0.5     # Центральные 50% защищены от детекции (увеличено)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -820,9 +821,18 @@ class SmartScreenshotCleaner:
         img_area = h * w
 
         for x1, y1, x2, y2 in all_boxes:
-            box_area = (x2 - x1) * (y2 - y1)
+            box_w = x2 - x1
+            box_h = y2 - y1
+            box_area = box_w * box_h
+
+            # Пропускаем слишком большие боксы (это не иконки!)
             if box_area > img_area * self.MAX_BOX_RATIO:
                 logger.info(f"Skipping large box {x1},{y1}-{x2},{y2}: {box_area/img_area*100:.1f}% of image")
+                continue
+
+            # Пропускаем боксы с большой стороной (иконки маленькие)
+            if box_w > self.MAX_BOX_SIDE or box_h > self.MAX_BOX_SIDE:
+                logger.info(f"Skipping box with large side {x1},{y1}-{x2},{y2}: {box_w}x{box_h}px")
                 continue
 
             # Расширяем маску на несколько пикселей для лучшего инпейнтинга
