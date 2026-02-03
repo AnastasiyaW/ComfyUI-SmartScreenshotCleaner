@@ -1,0 +1,17 @@
+# Core
+torch
+numpy
+opencv-python
+Pillow
+
+# YOLO UI Detection
+ultralytics
+huggingface_hub
+
+# SOD (Salient Object Detection) - выбери один:
+rembg[gpu]  # Рекомендуется - простой и работает
+# transparent-background  # Альтернатива
+# onnxruntime-gpu  # Для ONNX U2Net
+
+# LaMa Inpainting (опционально)
+simple-lama-inpainting  # pip install simple-lama-inpainting
