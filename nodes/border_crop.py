@@ -410,6 +410,53 @@ class AutoBorderCrop:
         has_content = color_content > 0.1 or brightness_content > 0.3
         return has_content
 
+    def _has_high_dynamics_at_border(self, img: torch.Tensor, side: str, border_pos: int) -> bool:
+        """Проверяет, есть ли высокая динамика контента на границе обрезки.
+        Если да — safe space можно игнорировать и резать рамку полностью.
+
+        Высокая динамика = контент с чёткой границей (не плавный переход).
+        """
+        h, w = img.shape[:2]
+        check_depth = 20  # проверяем 20 пикселей от границы обрезки
+
+        if side == 'left':
+            if border_pos >= w:
+                return False
+            strip = img[:, border_pos:min(border_pos + check_depth, w), :3]
+        elif side == 'right':
+            pos = w - border_pos
+            if pos <= 0:
+                return False
+            strip = img[:, max(0, pos - check_depth):pos, :3]
+        elif side == 'top':
+            if border_pos >= h:
+                return False
+            strip = img[border_pos:min(border_pos + check_depth, h), :, :3]
+        else:  # bottom
+            pos = h - border_pos
+            if pos <= 0:
+                return False
+            strip = img[max(0, pos - check_depth):pos, :, :3]
+
+        if strip.numel() == 0:
+            return False
+
+        # Считаем std по всей полосе
+        strip_std = strip.float().std(dim=(0, 1)).mean().item()
+
+        # Проверяем насыщенность (цветной контент)
+        pixels = strip.reshape(-1, 3).float()
+        saturation = (pixels.max(dim=1).values - pixels.min(dim=1).values)
+        color_ratio = (saturation > 30).float().mean().item()
+
+        # Высокая динамика = std > 40 ИЛИ много цветных пикселей
+        has_dynamics = strip_std > 40 or color_ratio > 0.3
+
+        if has_dynamics:
+            logger.info(f"{side}: high dynamics at border {border_pos}, std={strip_std:.1f}, color={color_ratio:.1%} -> ignore safe space")
+
+        return has_dynamics
+
     def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> torch.Tensor:
         """Обрабатывает одно изображение полностью на GPU."""
         img_gpu = (image.to(device) * 255.0).float()
@@ -456,7 +503,15 @@ class AutoBorderCrop:
                     else:
                         safe_limit = max(0, w - bx2 - self.SAFE_MARGIN_HORIZONTAL)
 
-                    if detected_border > safe_limit:
+                    # НОВОЕ: Проверяем динамику контента на границе обрезки
+                    # Если высокая динамика — игнорируем safe space и режем полностью
+                    has_dynamics = self._has_high_dynamics_at_border(img_gpu, side, detected_border)
+
+                    if has_dynamics:
+                        # Высокая динамика — чёткий край контента, режем полностью
+                        crop[side] = detected_border
+                        logger.info(f"{side}: high dynamics, ignoring safe space, crop={detected_border}")
+                    elif detected_border > safe_limit:
                         # Обрезка хочет зайти в safe space — ищем чёткую границу контента
                         sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, side, safe_limit, detected_border)
                         if sharp_edge is not None:
@@ -497,61 +552,70 @@ class AutoBorderCrop:
             safe_top = max(0, by1 - self.SAFE_MARGIN_VERTICAL)
             safe_bottom = max(0, h - by2 - self.SAFE_MARGIN_VERTICAL)
 
-            if top_border > safe_top:
-                # Сначала ищем чёткую границу контента в safe zone
-                sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'top', safe_top, top_border)
+            # НОВОЕ: Проверяем динамику контента на границах top/bottom
+            top_has_dynamics = self._has_high_dynamics_at_border(img_gpu, 'top', top_border) if top_border > 0 else False
+            bottom_has_dynamics = self._has_high_dynamics_at_border(img_gpu, 'bottom', bottom_border) if bottom_border > 0 else False
 
-                if sharp_edge is not None:
-                    # Нашли чёткую границу — режем до неё без дополнительной обработки
-                    crop['top'] = sharp_edge
-                    logger.info(f"Top: found sharp edge at {sharp_edge}, cropping to it")
-                elif ambiguous_start is not None:
-                    # Неоднозначная зона — режем до неё и заливаем LaMa
-                    crop['top'] = ambiguous_start
-                    need_lama = True
-                    logger.info(f"Top: ambiguous zone at {ambiguous_start}, crop there + LaMa")
-                elif top_type == 'uniform':
-                    fill_color = self._get_border_color_gpu(img_gpu, 'top')
-                    img_gpu[safe_top:top_border, :, :3] = fill_color
+            if top_border > 0:
+                if top_has_dynamics:
+                    # Высокая динамика — игнорируем safe space, режем полностью
                     crop['top'] = top_border
-                    logger.info(f"Top: uniform, filled {safe_top}-{top_border} with {fill_color.cpu().numpy()}, crop={top_border}")
-                elif top_type == 'dynamic':
+                    logger.info(f"Top: high dynamics, ignoring safe space, crop={top_border}")
+                elif top_border > safe_top:
+                    # Сначала ищем чёткую границу контента в safe zone
+                    sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'top', safe_top, top_border)
+
+                    if sharp_edge is not None:
+                        crop['top'] = sharp_edge
+                        logger.info(f"Top: found sharp edge at {sharp_edge}, cropping to it")
+                    elif ambiguous_start is not None:
+                        crop['top'] = ambiguous_start
+                        need_lama = True
+                        logger.info(f"Top: ambiguous zone at {ambiguous_start}, crop there + LaMa")
+                    elif top_type == 'uniform':
+                        fill_color = self._get_border_color_gpu(img_gpu, 'top')
+                        img_gpu[safe_top:top_border, :, :3] = fill_color
+                        crop['top'] = top_border
+                        logger.info(f"Top: uniform, filled {safe_top}-{top_border}, crop={top_border}")
+                    elif top_type == 'dynamic':
+                        crop['top'] = top_border
+                        logger.info(f"Top: dynamic edge, full crop={top_border}")
+                    else:
+                        need_lama = True
+                        crop['top'] = safe_top
+                        logger.info(f"Top: mixed, no sharp edge, crop to safe={safe_top}, LaMa needed")
+                else:
                     crop['top'] = top_border
-                    logger.info(f"Top: dynamic edge, full crop={top_border}")
-                else:
-                    need_lama = True
-                    crop['top'] = safe_top
-                    logger.info(f"Top: mixed, no sharp edge, crop to safe={safe_top}, LaMa needed")
-            else:
-                crop['top'] = top_border
 
-            if bottom_border > safe_bottom:
-                # Сначала ищем чёткую границу контента в safe zone
-                sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'bottom', safe_bottom, bottom_border)
+            if bottom_border > 0:
+                if bottom_has_dynamics:
+                    # Высокая динамика — игнорируем safe space, режем полностью
+                    crop['bottom'] = bottom_border
+                    logger.info(f"Bottom: high dynamics, ignoring safe space, crop={bottom_border}")
+                elif bottom_border > safe_bottom:
+                    sharp_edge, ambiguous_start = self._find_sharp_content_edge(img_gpu, 'bottom', safe_bottom, bottom_border)
 
-                if sharp_edge is not None:
-                    # Нашли чёткую границу — режем до неё
-                    crop['bottom'] = sharp_edge
-                    logger.info(f"Bottom: found sharp edge at {sharp_edge}, cropping to it")
-                elif ambiguous_start is not None:
-                    # Неоднозначная зона — режем до неё и заливаем LaMa
-                    crop['bottom'] = ambiguous_start
-                    need_lama = True
-                    logger.info(f"Bottom: ambiguous zone at {ambiguous_start}, crop there + LaMa")
-                elif bottom_type == 'uniform':
-                    fill_color = self._get_border_color_gpu(img_gpu, 'bottom')
-                    img_gpu[h-bottom_border:h-safe_bottom, :, :3] = fill_color
-                    crop['bottom'] = bottom_border
-                    logger.info(f"Bottom: uniform, filled with {fill_color.cpu().numpy()}, crop={bottom_border}")
-                elif bottom_type == 'dynamic':
-                    crop['bottom'] = bottom_border
-                    logger.info(f"Bottom: dynamic edge, full crop={bottom_border}")
+                    if sharp_edge is not None:
+                        crop['bottom'] = sharp_edge
+                        logger.info(f"Bottom: found sharp edge at {sharp_edge}, cropping to it")
+                    elif ambiguous_start is not None:
+                        crop['bottom'] = ambiguous_start
+                        need_lama = True
+                        logger.info(f"Bottom: ambiguous zone at {ambiguous_start}, crop there + LaMa")
+                    elif bottom_type == 'uniform':
+                        fill_color = self._get_border_color_gpu(img_gpu, 'bottom')
+                        img_gpu[h-bottom_border:h-safe_bottom, :, :3] = fill_color
+                        crop['bottom'] = bottom_border
+                        logger.info(f"Bottom: uniform, filled, crop={bottom_border}")
+                    elif bottom_type == 'dynamic':
+                        crop['bottom'] = bottom_border
+                        logger.info(f"Bottom: dynamic edge, full crop={bottom_border}")
+                    else:
+                        need_lama = True
+                        crop['bottom'] = safe_bottom
+                        logger.info(f"Bottom: mixed, crop to safe={safe_bottom}, LaMa needed")
                 else:
-                    need_lama = True
-                    crop['bottom'] = safe_bottom
-                    logger.info(f"Bottom: mixed, crop to safe={safe_bottom}, LaMa needed")
-            else:
-                crop['bottom'] = bottom_border
+                    crop['bottom'] = bottom_border
         else:
             crop['top'] = top_border
             crop['bottom'] = bottom_border
