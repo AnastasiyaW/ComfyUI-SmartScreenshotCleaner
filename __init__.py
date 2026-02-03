@@ -7,7 +7,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoBorderCrop": "Auto Border Crop",
-    "SmartScreenshotCleaner": "Smart Screenshot Cleaner (YOLO+SOD+LaMa)",
+    "SmartScreenshotCleaner": "Smart Screenshot Cleaner (YOLO+LaMa)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

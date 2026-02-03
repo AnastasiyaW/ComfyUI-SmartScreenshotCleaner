@@ -8,10 +8,5 @@ Pillow>=9.0.0
 ultralytics>=8.0.0
 huggingface_hub>=0.16.0
 
-# SOD - Salient Object Detection (GPU accelerated)
-# For GPU: pip install onnxruntime-gpu
-rembg>=2.0.50
-onnxruntime-gpu>=1.15.0
-
-# LaMa Inpainting (GPU accelerated, optional)
+# LaMa Inpainting (GPU accelerated)
 simple-lama-inpainting>=0.1.0
