@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 import os
 import logging
 
@@ -28,7 +28,6 @@ class AutoBorderCrop:
     Поддерживает batch processing.
     """
 
-    # Константы для детекции
     SENSITIVITY_MULTIPLIER = 2.0
 
     @classmethod
@@ -84,7 +83,6 @@ class AutoBorderCrop:
             h, w = img.shape[:2]
             c = img.shape[2] if len(img.shape) > 2 else 1
 
-            # Убедимся что есть 3 канала
             if c == 1:
                 img = np.stack([img.squeeze()] * 3, axis=-1)
 
@@ -95,7 +93,6 @@ class AutoBorderCrop:
             crop_left = self._detect_border(img_uint8, 'left', sensitivity, min_border_size)
             crop_right = self._detect_border(img_uint8, 'right', sensitivity, min_border_size)
 
-            # Валидация
             remaining_h = h - crop_top - crop_bottom
             remaining_w = w - crop_left - crop_right
             min_h = int(h * min_content_percent / 100)
@@ -104,17 +101,14 @@ class AutoBorderCrop:
             if remaining_h < min_h or remaining_w < min_w or remaining_h <= 0 or remaining_w <= 0:
                 crop_top, crop_bottom, crop_left, crop_right = 0, 0, 0, 0
 
-            # Сохраняем crop values от первого изображения
             if crop_values is None:
                 crop_values = (crop_top, crop_bottom, crop_left, crop_right)
 
-            # Применяем обрезку
             y_end = h - crop_bottom if crop_bottom > 0 else h
             x_end = w - crop_right if crop_right > 0 else w
             cropped = image[b:b+1, crop_top:y_end, crop_left:x_end, :]
             results.append(cropped)
 
-        # Собираем batch
         output = torch.cat(results, dim=0) if results else image
         was_cropped = any(v > 0 for v in crop_values) if crop_values else False
 
@@ -123,9 +117,7 @@ class AutoBorderCrop:
     def _detect_border(self, img: np.ndarray, side: str, sensitivity: float, min_border_size: int) -> int:
         """Детектирует границу рамки с указанной стороны."""
         h, w = img.shape[:2]
-        c = img.shape[2] if len(img.shape) > 2 else 1
 
-        # Настройки для каждой стороны
         if side == 'top':
             get_line = lambda i: img[i, :, :3]
             max_scan = h // 2
@@ -135,7 +127,7 @@ class AutoBorderCrop:
         elif side == 'left':
             get_line = lambda i: img[:, i, :3]
             max_scan = w // 2
-        else:  # right
+        else:
             get_line = lambda i: img[:, w - 1 - i, :3]
             max_scan = w // 2
 
@@ -165,26 +157,20 @@ class SmartScreenshotCleaner:
     """
     Умная нода для очистки скриншотов от UI элементов.
 
+    Использует OmniParser v2.0 от Microsoft — обучен на 67K реальных скриншотов.
+    Детектирует интерактивные UI элементы (кнопки, иконки, текст) по их визуальным
+    паттернам, а не по позиции на экране.
+
     Возможности:
-    - YOLO детекция UI (deki-yolo) - GPU accelerated
+    - YOLO детекция UI (OmniParser) - GPU accelerated
     - SOD детекция контента (U2Net) - GPU accelerated
     - LaMa инпеинтинг - GPU accelerated
     - Batch processing
-
-    Модели скачиваются автоматически при первом запуске.
     """
 
-    # Константы моделей
-    MODEL_REPO_YOLO = "orasul/deki-yolo"
-    MODEL_FILE_YOLO = "best.pt"
-
-    # Константы для анализа
-    EDGE_SAMPLE_SIZE = 20
-    DARK_UI_THRESHOLD = 60
-    BRIGHTNESS_STD_THRESHOLD = 20
-    DARK_BRIGHTNESS_MAX = 70
-    LIGHT_BRIGHTNESS_MIN = 200
-    UI_DENSITY_THRESHOLD = 0.2
+    # OmniParser v2.0 от Microsoft — лучшая модель для UI детекции
+    MODEL_REPO = "microsoft/OmniParser-v2.0"
+    MODEL_FILE = "icon_detect/model.pt"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -196,11 +182,11 @@ class SmartScreenshotCleaner:
                     "tooltip": "hybrid=YOLO+SOD, yolo_only=только UI детекция, sod_only=только контент, full_inpaint=очистка+заливка"
                 }),
                 "yolo_confidence": ("FLOAT", {
-                    "default": 0.25,
-                    "min": 0.1,
+                    "default": 0.15,
+                    "min": 0.05,
                     "max": 0.9,
                     "step": 0.05,
-                    "tooltip": "Порог уверенности YOLO"
+                    "tooltip": "Порог уверенности YOLO (ниже = больше детекций)"
                 }),
                 "sod_threshold": ("FLOAT", {
                     "default": 0.5,
@@ -255,10 +241,10 @@ class SmartScreenshotCleaner:
         os.makedirs(models_dir, exist_ok=True)
         return models_dir
 
-    # ==================== YOLO (GPU) ====================
+    # ==================== YOLO (OmniParser v2.0) ====================
 
     def _load_yolo(self):
-        """Загружает YOLO модель на GPU."""
+        """Загружает OmniParser YOLO модель."""
         if self.yolo_model is not None:
             return self.yolo_model
 
@@ -266,21 +252,20 @@ class SmartScreenshotCleaner:
             from ultralytics import YOLO
             from huggingface_hub import hf_hub_download
 
-            logger.info(f"Downloading YOLO model from {self.MODEL_REPO_YOLO}...")
+            logger.info(f"Downloading OmniParser model from {self.MODEL_REPO}...")
 
             model_path = hf_hub_download(
-                repo_id=self.MODEL_REPO_YOLO,
-                filename=self.MODEL_FILE_YOLO,
+                repo_id=self.MODEL_REPO,
+                filename=self.MODEL_FILE,
                 cache_dir=self._models_dir
             )
 
             self.yolo_model = YOLO(model_path)
 
-            # Переносим на GPU если доступно
             if self.device.type == "cuda":
                 self.yolo_model.to(self.device)
 
-            logger.info(f"YOLO loaded on {self.device}")
+            logger.info(f"OmniParser YOLO loaded on {self.device}")
             return self.yolo_model
 
         except ImportError as e:
@@ -292,7 +277,7 @@ class SmartScreenshotCleaner:
 
     @torch.no_grad()
     def _detect_ui_yolo(self, img_np: np.ndarray, conf: float) -> Tuple[List[dict], np.ndarray]:
-        """Детектирует UI элементы через YOLO на GPU."""
+        """Детектирует UI элементы через OmniParser YOLO."""
         model = self._load_yolo()
         h, w = img_np.shape[:2]
         mask = np.zeros((h, w), dtype=np.float32)
@@ -300,11 +285,9 @@ class SmartScreenshotCleaner:
         if model is None:
             return [], mask
 
-        # YOLO inference (автоматически на GPU если модель там)
+        # OmniParser детектирует интерактивные элементы
         results = model.predict(img_np, conf=conf, verbose=False, device=self.device)
         detections = []
-
-        class_names = ["View", "ImageView", "Text", "Line"]
 
         for result in results:
             boxes = result.boxes
@@ -316,21 +299,25 @@ class SmartScreenshotCleaner:
                 conf_score = float(boxes.conf[i].cpu().item())
                 cls = int(boxes.cls[i].cpu().item())
 
-                class_name = class_names[cls] if cls < len(class_names) else f"class_{cls}"
-
                 x1, y1, x2, y2 = box
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
 
+                # Пропускаем слишком большие детекции (это не UI, а контент)
+                box_area = (x2 - x1) * (y2 - y1)
+                img_area = h * w
+                if box_area > img_area * 0.5:  # Больше 50% изображения — не UI
+                    continue
+
                 detections.append({
                     "box": (x1, y1, x2, y2),
                     "confidence": conf_score,
-                    "class": class_name,
+                    "class_id": cls,
                 })
 
                 mask[y1:y2, x1:x2] = 1.0
 
-        logger.info(f"YOLO detected {len(detections)} UI elements")
+        logger.info(f"OmniParser detected {len(detections)} UI elements")
         return detections, mask
 
     # ==================== SOD (GPU) ====================
@@ -343,7 +330,6 @@ class SmartScreenshotCleaner:
         try:
             from rembg import new_session
 
-            # Используем u2net с GPU провайдером если доступно
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device.type == "cuda" else ['CPUExecutionProvider']
 
             logger.info(f"Loading SOD model with providers: {providers}")
@@ -393,7 +379,6 @@ class SmartScreenshotCleaner:
         try:
             from simple_lama_inpainting import SimpleLama
 
-            # SimpleLama автоматически использует CUDA если доступно
             self.lama_model = SimpleLama()
             logger.info(f"LaMa loaded (device: {'cuda' if torch.cuda.is_available() else 'cpu'})")
             return self.lama_model
@@ -414,7 +399,6 @@ class SmartScreenshotCleaner:
         if mask.max() == 0:
             return img_np
 
-        # Расширяем маску
         if expand_px > 0:
             kernel = np.ones((expand_px * 2 + 1, expand_px * 2 + 1), np.uint8)
             mask_expanded = cv2.dilate((mask * 255).astype(np.uint8), kernel, iterations=1)
@@ -432,7 +416,6 @@ class SmartScreenshotCleaner:
             except Exception as e:
                 logger.warning(f"LaMa inpaint error: {e}, falling back to OpenCV")
 
-        # Fallback: OpenCV TELEA
         try:
             result = cv2.inpaint(img_np, mask_expanded, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
             logger.info("Used OpenCV TELEA inpainting")
@@ -443,16 +426,26 @@ class SmartScreenshotCleaner:
 
     # ==================== Content Region Detection ====================
 
-    def _find_content_bounds(
+    def _find_content_bounds_by_ui(
         self,
         h: int, w: int,
         ui_mask: np.ndarray,
         content_mask: np.ndarray,
         min_ratio: float
     ) -> Tuple[int, int, int, int]:
-        """Находит границы контента по маскам."""
+        """
+        Находит границы контента на основе UI детекций.
+
+        Логика: ищем самую большую область БЕЗ UI элементов.
+        UI элементы обычно сгруппированы сверху (статус бар, хедер)
+        и снизу (навигация, лайки). Контент — в середине.
+        """
         # Контент = SOD маска минус UI маска
         combined = content_mask * (1 - ui_mask)
+
+        # Если SOD не дал хорошей маски, используем инверсию UI
+        if content_mask.mean() > 0.9:
+            combined = 1 - ui_mask
 
         rows_with_content = np.any(combined > 0.5, axis=1)
         cols_with_content = np.any(combined > 0.5, axis=0)
@@ -468,62 +461,61 @@ class SmartScreenshotCleaner:
         left = int(col_indices[0])
         right = int(w - col_indices[-1] - 1)
 
-        # Валидация
         if (h - top - bottom) < h * min_ratio or (w - left - right) < w * min_ratio:
             return (0, 0, 0, 0)
 
         return (top, bottom, left, right)
 
-    def _find_content_by_analysis(
+    def _find_content_by_ui_gaps(
         self,
-        img: np.ndarray,
-        ui_mask: np.ndarray,
+        h: int, w: int,
+        detections: List[dict],
         min_ratio: float
     ) -> Tuple[int, int, int, int]:
-        """Fallback: анализ яркости для поиска контента."""
-        h, w = img.shape[:2]
+        """
+        Находит контент по промежуткам между UI элементами.
 
-        gray = np.mean(img[:, :, :3], axis=2) if len(img.shape) > 2 and img.shape[2] >= 3 else img
-        row_brightness = np.mean(gray, axis=1)
-        row_std = np.std(gray, axis=1)
-        row_ui = np.mean(ui_mask, axis=1)
-
-        # Определяем тип UI (тёмный/светлый)
-        edge_sample = min(self.EDGE_SAMPLE_SIZE, h // 10)
-        edge_brightness = np.mean([row_brightness[:edge_sample].mean(), row_brightness[-edge_sample:].mean()])
-        is_dark_ui = edge_brightness < self.DARK_UI_THRESHOLD
-
-        # Поиск верхней границы
-        top = 0
-        max_scan = min(h // 3, 400)
-        for i in range(max_scan):
-            is_ui = row_ui[i] > self.UI_DENSITY_THRESHOLD
-            is_bg = row_std[i] < self.BRIGHTNESS_STD_THRESHOLD and (
-                (is_dark_ui and row_brightness[i] < self.DARK_BRIGHTNESS_MAX) or
-                (not is_dark_ui and row_brightness[i] > self.LIGHT_BRIGHTNESS_MIN)
-            )
-            if is_ui or is_bg:
-                top = i + 1
-            elif top > 0:
-                break
-
-        # Поиск нижней границы
-        bottom = 0
-        for i in range(max_scan):
-            idx = h - 1 - i
-            is_ui = row_ui[idx] > self.UI_DENSITY_THRESHOLD
-            is_bg = row_std[idx] < self.BRIGHTNESS_STD_THRESHOLD and (
-                (is_dark_ui and row_brightness[idx] < self.DARK_BRIGHTNESS_MAX) or
-                (not is_dark_ui and row_brightness[idx] > self.LIGHT_BRIGHTNESS_MIN)
-            )
-            if is_ui or is_bg:
-                bottom = i + 1
-            elif bottom > 0:
-                break
-
-        # Валидация
-        if (h - top - bottom) < h * min_ratio:
+        Ищет самый большой вертикальный промежуток без UI — это контент.
+        """
+        if not detections:
             return (0, 0, 0, 0)
+
+        # Собираем все y-координаты UI элементов
+        ui_rows = set()
+        for det in detections:
+            x1, y1, x2, y2 = det["box"]
+            for y in range(y1, min(y2, h)):
+                ui_rows.add(y)
+
+        # Ищем промежутки без UI
+        gaps = []
+        gap_start = None
+
+        for y in range(h):
+            if y not in ui_rows:
+                if gap_start is None:
+                    gap_start = y
+            else:
+                if gap_start is not None:
+                    gaps.append((gap_start, y - 1))
+                    gap_start = None
+
+        if gap_start is not None:
+            gaps.append((gap_start, h - 1))
+
+        if not gaps:
+            return (0, 0, 0, 0)
+
+        # Находим самый большой промежуток
+        largest_gap = max(gaps, key=lambda g: g[1] - g[0])
+        gap_start, gap_end = largest_gap
+        gap_size = gap_end - gap_start
+
+        if gap_size < h * min_ratio:
+            return (0, 0, 0, 0)
+
+        top = gap_start
+        bottom = h - gap_end - 1
 
         return (top, bottom, 0, 0)
 
@@ -534,19 +526,13 @@ class SmartScreenshotCleaner:
         self,
         image: torch.Tensor,
         mode: str = "hybrid",
-        yolo_confidence: float = 0.25,
+        yolo_confidence: float = 0.15,
         sod_threshold: float = 0.5,
         expand_mask_px: int = 5,
         crop_to_content: bool = True,
         min_content_ratio: float = 0.2,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
-        """
-        Основной метод обработки. Поддерживает batch.
-
-        Returns:
-            cleaned_image, original_cropped, ui_mask, content_mask,
-            crop_top, crop_bottom, crop_left, crop_right
-        """
+        """Основной метод обработки. Поддерживает batch."""
 
         batch_size = image.shape[0]
         cleaned_list = []
@@ -564,7 +550,6 @@ class SmartScreenshotCleaner:
             h, w = img.shape[:2]
             c = img.shape[2] if len(img.shape) > 2 else 1
 
-            # Нормализуем к 3 каналам
             if c == 1:
                 img = np.stack([img.squeeze()] * 3, axis=-1)
             elif c == 4:
@@ -572,12 +557,13 @@ class SmartScreenshotCleaner:
 
             img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
-            # 1. Детекция UI
+            # 1. Детекция UI через OmniParser
             ui_mask = np.zeros((h, w), dtype=np.float32)
+            detections = []
             if use_yolo:
-                _, ui_mask = self._detect_ui_yolo(img_uint8, yolo_confidence)
+                detections, ui_mask = self._detect_ui_yolo(img_uint8, yolo_confidence)
 
-            # 2. Детекция контента
+            # 2. Детекция контента через SOD
             content_mask = np.ones((h, w), dtype=np.float32)
             if use_sod:
                 content_mask = self._detect_content_sod(img_uint8, sod_threshold)
@@ -591,16 +577,18 @@ class SmartScreenshotCleaner:
             # 4. Определение границ обрезки
             crop_top, crop_bottom, crop_left, crop_right = 0, 0, 0, 0
             if crop_to_content:
-                if use_sod and content_mask.mean() < 0.95:
-                    crop_top, crop_bottom, crop_left, crop_right = self._find_content_bounds(
-                        h, w, ui_mask, content_mask, min_content_ratio
-                    )
-                else:
-                    crop_top, crop_bottom, crop_left, crop_right = self._find_content_by_analysis(
-                        img_uint8, ui_mask, min_content_ratio
+                # Сначала пробуем по UI детекциям
+                if detections:
+                    crop_top, crop_bottom, crop_left, crop_right = self._find_content_by_ui_gaps(
+                        h, w, detections, min_content_ratio
                     )
 
-            # Сохраняем crop от первого изображения
+                # Если не получилось — используем маски
+                if crop_top == 0 and crop_bottom == 0:
+                    crop_top, crop_bottom, crop_left, crop_right = self._find_content_bounds_by_ui(
+                        h, w, ui_mask, content_mask, min_content_ratio
+                    )
+
             if final_crop is None:
                 final_crop = (crop_top, crop_bottom, crop_left, crop_right)
 
@@ -613,13 +601,11 @@ class SmartScreenshotCleaner:
             ui_mask_cropped = ui_mask[crop_top:y_end, crop_left:x_end]
             content_mask_cropped = content_mask[crop_top:y_end, crop_left:x_end]
 
-            # Конвертируем в тензоры
             cleaned_list.append(torch.from_numpy(cleaned_cropped.astype(np.float32) / 255.0))
             original_list.append(torch.from_numpy(original_cropped.astype(np.float32) / 255.0))
             ui_mask_list.append(torch.from_numpy(ui_mask_cropped))
             content_mask_list.append(torch.from_numpy(content_mask_cropped))
 
-        # Собираем batch
         cleaned_tensor = torch.stack(cleaned_list, dim=0)
         original_tensor = torch.stack(original_list, dim=0)
         ui_mask_tensor = torch.stack(ui_mask_list, dim=0)
