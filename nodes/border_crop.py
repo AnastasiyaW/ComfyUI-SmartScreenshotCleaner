@@ -235,23 +235,26 @@ class AutoBorderCrop:
     def _is_border_line(self, saturation: float, std: float, uniform_ratio: float) -> bool:
         """Проверяет, является ли линия частью рамки.
 
+        КЛЮЧЕВОЙ КРИТЕРИЙ: Рамка = СЕРЫЙ/ЧЁРНЫЙ/БЕЛЫЙ (R≈G≈B)
+        Если есть цвет (насыщенность > 20) — это НЕ рамка, даже если однотонно!
+
         Рамка если:
-        - >85% пикселей однотонные (серые/ч/б) — даже если есть немного цветного UI
-        - ИЛИ низкая динамика + низкая насыщенность
-        - ИЛИ очень низкая динамика (артефакты сжатия дают STD до 25)
+        - Низкая насыщенность (серый, R≈G≈B) + низкая динамика
+        - >95% пикселей серые (uniform_ratio высокий) + низкая насыщенность
         """
-        # Главный критерий: >85% линии — однотонные пиксели
-        if uniform_ratio >= 0.85:
+        # ВАЖНО: Если есть цвет — это НЕ рамка (даже однотонный зелёный фон = фото)
+        if saturation > 25.0:
+            return False
+
+        # Серый + однотонный = рамка
+        is_gray = saturation < self.GRAY_MAX_SATURATION  # < 30
+        is_uniform = std < self.GRAY_MAX_STD  # < 25
+
+        if is_gray and is_uniform:
             return True
 
-        # Или классика: низкая динамика + серый
-        is_uniform = std < self.GRAY_MAX_STD
-        is_gray = saturation < self.GRAY_MAX_SATURATION
-        if is_uniform and is_gray:
-            return True
-
-        # STD < 30 при низкой насыщенности — тоже рамка (артефакты сжатия)
-        if std < 30.0 and saturation < 40.0:
+        # >95% серых пикселей + низкая насыщенность
+        if uniform_ratio >= 0.95 and saturation < 20.0:
             return True
 
         return False
@@ -259,21 +262,24 @@ class AutoBorderCrop:
     def _is_picture_line(self, saturation: float, std: float, uniform_ratio: float) -> bool:
         """Проверяет, является ли линия частью картинки.
 
+        КЛЮЧЕВОЙ КРИТЕРИЙ: Если есть ЦВЕТ (насыщенность > 25) — это картинка!
+        Даже однотонный зелёный/синий фон = часть фото, НЕ резать.
+
         Картинка если:
-        - Много цветных пикселей (<60% однотонных)
+        - Есть цвет (насыщенность > 25) — даже если однотонно
         - ИЛИ высокая динамика (STD > 40)
-        - ИЛИ высокая насыщенность + средняя динамика
+        - ИЛИ много цветных пикселей (<60% серых)
         """
-        # Много цветных пикселей — это картинка
-        if uniform_ratio < 0.60:
+        # ГЛАВНОЕ: Есть цвет — это картинка! (зелёный фон, синее небо и т.д.)
+        if saturation > 25.0:
             return True
 
         # Высокая динамика — картинка
         if std >= self.PICTURE_MIN_STD:
             return True
 
-        # Высокая насыщенность + заметная динамика
-        if saturation >= 50.0 and std >= 30.0:
+        # Много цветных пикселей
+        if uniform_ratio < 0.60:
             return True
 
         return False
