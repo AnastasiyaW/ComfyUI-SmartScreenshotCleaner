@@ -361,29 +361,28 @@ class AutoBorderCrop:
 
             # Определяем финальную обрезку
             if found_picture:
-                # Нашли границу картинки — режем точно до неё
+                # Нашли границу картинки — режем точно до неё, оставляем ВСЕ цветные пиксели
                 final_border = border
                 logger.info(f"{side}: cut to PICTURE boundary: {final_border}px")
             else:
-                # Не нашли картинку — это рамка
+                # НЕ нашли картинку — всё серое, применяем safe margin от человека
                 final_border = border
-                logger.info(f"{side}: cut border: {final_border}px")
 
-            # ВСЕГДА применяем safe margin от человека (200px в каждую сторону)
-            if person_bbox:
-                py1, py2, px1, px2 = person_bbox
-                if side == 'top':
-                    safe_limit = max(0, py1 - self.SAFE_MARGIN)
-                elif side == 'bottom':
-                    safe_limit = max(0, h - py2 - self.SAFE_MARGIN)
-                elif side == 'left':
-                    safe_limit = max(0, px1 - self.SAFE_MARGIN)
-                else:  # right
-                    safe_limit = max(0, w - px2 - self.SAFE_MARGIN)
+                if person_bbox:
+                    py1, py2, px1, px2 = person_bbox
+                    if side == 'top':
+                        safe_limit = max(0, py1 - self.SAFE_MARGIN)
+                    elif side == 'bottom':
+                        safe_limit = max(0, h - py2 - self.SAFE_MARGIN)
+                    elif side == 'left':
+                        safe_limit = max(0, px1 - self.SAFE_MARGIN)
+                    else:  # right
+                        safe_limit = max(0, w - px2 - self.SAFE_MARGIN)
 
-                if final_border > safe_limit:
-                    logger.info(f"{side}: safe margin limit {safe_limit}px (was {final_border}px)")
-                    final_border = safe_limit
+                    final_border = min(final_border, safe_limit)
+                    logger.info(f"{side}: no picture found, safe margin: {final_border}px (limit {safe_limit}px)")
+                else:
+                    logger.info(f"{side}: no picture, no person, cut border: {final_border}px")
 
             crop[side] = final_border
 
