@@ -123,9 +123,8 @@ class AutoBorderCrop:
     4. Safe margins от человека ТОЛЬКО если вокруг него рамка (не картинка)
     """
 
-    # Safe margins (ТОЛЬКО когда вокруг человека рамка, не картинка)
-    SAFE_MARGIN_VERTICAL = 50
-    SAFE_MARGIN_HORIZONTAL = 300
+    # Safe margins — ВСЕГДА оставляем отступ от человека
+    SAFE_MARGIN = 200  # 200px в каждую сторону от bbox человека
 
     # Пороги для определения рамки
     GRAY_MAX_SATURATION = 30.0    # max(R,G,B) - min(R,G,B) < 30 = серый/ч/б
@@ -335,52 +334,6 @@ class AutoBorderCrop:
 
         return (border_size if border_size >= self.MIN_BORDER_TO_CUT else 0, found_picture)
 
-    def _check_area_around_person(self, img: torch.Tensor, person_bbox: Tuple, side: str) -> bool:
-        """Проверяет, есть ли рамка (не картинка) вокруг человека с данной стороны.
-
-        Returns:
-            True если вокруг человека рамка (можно применить safe margin)
-            False если вокруг человека картинка (нельзя резать)
-        """
-        h, w = img.shape[:2]
-        py1, py2, px1, px2 = person_bbox
-        check_depth = 30  # Проверяем 30px вокруг bbox человека
-
-        if side == 'top':
-            if py1 < check_depth:
-                return False  # Человек слишком близко к краю
-            area = img[max(0, py1-check_depth):py1, px1:px2, :3]
-        elif side == 'bottom':
-            if py2 > h - check_depth:
-                return False
-            area = img[py2:min(h, py2+check_depth), px1:px2, :3]
-        elif side == 'left':
-            if px1 < check_depth:
-                return False
-            area = img[py1:py2, max(0, px1-check_depth):px1, :3]
-        else:  # right
-            if px2 > w - check_depth:
-                return False
-            area = img[py1:py2, px2:min(w, px2+check_depth), :3]
-
-        if area.numel() == 0:
-            return False
-
-        saturation, std, uniform_ratio = self._analyze_line(area)
-
-        # Если вокруг человека картинка — нельзя применять safe margin
-        if self._is_picture_line(saturation, std, uniform_ratio):
-            logger.info(f"{side}: PICTURE around person (uniform={uniform_ratio:.0%}) — no safe margin")
-            return False
-
-        # Если вокруг человека рамка — можно применить safe margin
-        if self._is_border_line(saturation, std, uniform_ratio):
-            logger.info(f"{side}: BORDER around person (uniform={uniform_ratio:.0%}) — apply safe margin")
-            return True
-
-        # Неопределённо — лучше не резать
-        return False
-
     def _process_single_image_gpu(self, image: torch.Tensor, sensitivity: float, min_border_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Обрабатывает одно изображение.
 
@@ -411,30 +364,26 @@ class AutoBorderCrop:
                 # Нашли границу картинки — режем точно до неё
                 final_border = border
                 logger.info(f"{side}: cut to PICTURE boundary: {final_border}px")
-            elif person_bbox:
-                # НЕ нашли картинку — проверяем, есть ли рамка вокруг человека
-                if self._check_area_around_person(img_gpu, person_bbox, side):
-                    # Вокруг человека рамка — применяем safe margin
-                    py1, py2, px1, px2 = person_bbox
-                    if side == 'top':
-                        safe_limit = max(0, py1 - self.SAFE_MARGIN_VERTICAL)
-                    elif side == 'bottom':
-                        safe_limit = max(0, h - py2 - self.SAFE_MARGIN_VERTICAL)
-                    elif side == 'left':
-                        safe_limit = max(0, px1 - self.SAFE_MARGIN_HORIZONTAL)
-                    else:  # right
-                        safe_limit = max(0, w - px2 - self.SAFE_MARGIN_HORIZONTAL)
-
-                    final_border = min(border, safe_limit) if safe_limit > 0 else 0
-                    logger.info(f"{side}: safe margin applied: border={border}, limit={safe_limit}, final={final_border}")
-                else:
-                    # Вокруг человека картинка или неясно — режем до найденной границы
-                    final_border = border
-                    logger.info(f"{side}: no safe margin (picture around person): {final_border}px")
             else:
-                # Нет человека — режем всю найденную рамку
+                # Не нашли картинку — это рамка
                 final_border = border
                 logger.info(f"{side}: cut border: {final_border}px")
+
+            # ВСЕГДА применяем safe margin от человека (200px в каждую сторону)
+            if person_bbox:
+                py1, py2, px1, px2 = person_bbox
+                if side == 'top':
+                    safe_limit = max(0, py1 - self.SAFE_MARGIN)
+                elif side == 'bottom':
+                    safe_limit = max(0, h - py2 - self.SAFE_MARGIN)
+                elif side == 'left':
+                    safe_limit = max(0, px1 - self.SAFE_MARGIN)
+                else:  # right
+                    safe_limit = max(0, w - px2 - self.SAFE_MARGIN)
+
+                if final_border > safe_limit:
+                    logger.info(f"{side}: safe margin limit {safe_limit}px (was {final_border}px)")
+                    final_border = safe_limit
 
             crop[side] = final_border
 
